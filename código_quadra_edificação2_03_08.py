@@ -8,6 +8,7 @@ from qgis.core import (
 )
 from qgis.utils import iface
 from qgis.PyQt.QtWidgets import QInputDialog
+from collections import defaultdict
 
 # ==========================================
 # 1. NOMES DAS CAMADAS NO PROJETO DO QGIS
@@ -121,8 +122,9 @@ def extrair_lotes_e_quadras_por_setor():
         
         ids_edificacoes_no_setor = index_edif.intersects(bbox_setor)
         edificacoes_isoladas = []
+        edificacoes_encostadas = [] # Novo grupo para as que tocam a quadra mas não têm lote
         
-        # --- Coleta apenas edificações que não tocam lotes/quadras ---
+        # --- Coleta as edificações sem lote ---
         for id_edif in ids_edificacoes_no_setor:
             if id_edif in edificacoes_processadas:
                 continue 
@@ -135,17 +137,81 @@ def extrair_lotes_e_quadras_por_setor():
                 
             bbox_edif = geom_edif.boundingBox()
 
-            # Descarta se já tocar em Lote ou Quadra existente
+            # Descarta se já tocar em Lote existente (pois já tem lote)
             toca_lote = any(geom_edif.intersects(layer_lotes.getFeature(id_l).geometry()) for id_l in index_lotes.intersects(bbox_edif))
             if toca_lote: continue
             
-            toca_quadra = any(geom_edif.intersects(layer_quadras.getFeature(id_q).geometry()) for id_q in index_quadras.intersects(bbox_edif))
-            if toca_quadra: continue
+            # Verifica se toca em alguma Quadra existente
+            quadras_tocadas = []
+            for id_q in index_quadras.intersects(bbox_edif):
+                feat_quadra = layer_quadras.getFeature(id_q)
+                if geom_edif.intersects(feat_quadra.geometry()):
+                    quadras_tocadas.append(feat_quadra)
 
-            edificacoes_isoladas.append(feat_edif)
+            if quadras_tocadas:
+                # Se toca quadra mas NÃO toca lote, vai ganhar um lote DENTRO/JUNTO dessa quadra existente
+                # Pegamos a primeira quadra que ela toca como referência
+                edificacoes_encostadas.append((feat_edif, quadras_tocadas[0]))
+            else:
+                # Se não toca lote nem quadra, está 100% isolada
+                edificacoes_isoladas.append(feat_edif)
+                
             edificacoes_processadas.add(id_edif)
 
-        # --- Agrupa as edificações que se tocam ---
+        # =====================================================================
+        # TRATAMENTO 1: Edificações encostadas na quadra (Têm quadra, sem lote)
+        # =====================================================================
+        # Agrupa as edificações pela Quadra que elas tocam
+        edificacoes_por_quadra = defaultdict(list)
+        for feat_edif, feat_q in edificacoes_encostadas:
+            edificacoes_por_quadra[feat_q.id()].append(feat_edif)
+
+        for id_q, edifs in edificacoes_por_quadra.items():
+            feat_q = layer_quadras.getFeature(id_q)
+            sq_existente = feat_q['sq']
+            cod_qf_existente = feat_q['cod_qf']
+            
+            # Encontra o maior lote (cod_lf) já existente para esta quadra específica
+            request_lotes_quadra = QgsFeatureRequest().setFilterExpression(f'"sq" = \'{sq_existente}\'')
+            maior_cod_lf = 0
+            for feat_l in layer_lotes.getFeatures(request_lotes_quadra):
+                val_lf = feat_l['cod_lf']
+                if val_lf and str(val_lf).isdigit():
+                    maior_cod_lf = max(maior_cod_lf, int(val_lf))
+            
+            cod_lf_atual = maior_cod_lf + 1
+
+            for feat_edif in edifs:
+                proximo_id_lote += 1
+                proximo_fid_lote += 1
+
+                str_lf_atual = str(cod_lf_atual).zfill(3)
+                str_sql_atual = f"{sq_existente}{str_lf_atual}"
+                str_sqle_atual = f"{str_sql_atual}01"
+
+                # Atualiza a Edificação
+                if feat_edif.fields().indexOf('sql') != -1: feat_edif['sql'] = str_sql_atual
+                if feat_edif.fields().indexOf('sqle') != -1: feat_edif['sqle'] = str_sqle_atual
+                if feat_edif.fields().indexOf('cod_ef') != -1: feat_edif['cod_ef'] = 1
+                edificacoes_para_atualizar.append(feat_edif)
+
+                # Cria o Lote usando a geometria da edificação
+                nova_feat_lote = QgsFeature(layer_lotes.fields())
+                nova_feat_lote.setGeometry(feat_edif.geometry()) 
+                if nova_feat_lote.fields().indexOf('sq') != -1: nova_feat_lote['sq'] = sq_existente
+                if nova_feat_lote.fields().indexOf('sql') != -1: nova_feat_lote['sql'] = str_sql_atual
+                if nova_feat_lote.fields().indexOf('cod_sf_sat') != -1: nova_feat_lote['cod_sf_sat'] = valor_sf_sat
+                if nova_feat_lote.fields().indexOf('cod_qf') != -1: nova_feat_lote['cod_qf'] = cod_qf_existente
+                if nova_feat_lote.fields().indexOf('cod_lf') != -1: nova_feat_lote['cod_lf'] = cod_lf_atual
+                if nova_feat_lote.fields().indexOf('id') != -1: nova_feat_lote['id'] = proximo_id_lote
+                if nova_feat_lote.fields().indexOf('fid') != -1: nova_feat_lote['fid'] = proximo_fid_lote
+                novas_features_lote.append(nova_feat_lote)
+
+                cod_lf_atual += 1
+
+        # =====================================================================
+        # TRATAMENTO 2: Edificações 100% isoladas (Cria Quadra + Lotes)
+        # =====================================================================
         grupos = []
         visitados = set()
         
@@ -164,7 +230,7 @@ def extrair_lotes_e_quadras_por_setor():
                 for outra_feat in edificacoes_isoladas:
                     if outra_feat.id() in visitados: continue
                     
-                    # Se as edificações se tocam, pertencem ao mesmo grupo
+                    # Se as edificações se tocam, pertencem ao mesmo grupo isolado
                     if geom_atual.intersects(outra_feat.geometry()):
                         visitados.add(outra_feat.id())
                         grupo_atual.append(outra_feat)
@@ -172,9 +238,8 @@ def extrair_lotes_e_quadras_por_setor():
             
             grupos.append(grupo_atual)
 
-        # --- Cria uma Quadra e Múltiplos Lotes ---
         for grupo in grupos:
-            # Cria a geometria combinada APENAS para a quadra
+            # Cria a geometria combinada APENAS para a quadra nova
             geom_combinada = QgsGeometry(grupo[0].geometry())
             for feat in grupo[1:]:
                 geom_combinada = geom_combinada.combine(feat.geometry())
@@ -182,7 +247,7 @@ def extrair_lotes_e_quadras_por_setor():
             proximo_id_quadra += 1
             proximo_fid_quadra += 1
 
-            # Códigos base da Quadra
+            # Códigos base da Nova Quadra
             str_sf_sat = str(valor_sf_sat).zfill(3)
             str_qf_atual = str(proximo_qf).zfill(4)
             str_sq_atual = f"{str_sf_sat}{str_qf_atual}"
@@ -199,7 +264,7 @@ def extrair_lotes_e_quadras_por_setor():
             novas_features_quadra.append(nova_feat_quadra)
 
             # Processa cada edificação individualmente para criar seu Lote
-            cod_lf_atual = 1 # O contador de lotes reinicia para cada nova quadra
+            cod_lf_atual = 1 # O contador de lotes reinicia
             
             for feat_edif in grupo:
                 proximo_id_lote += 1
@@ -217,7 +282,7 @@ def extrair_lotes_e_quadras_por_setor():
                 
                 edificacoes_para_atualizar.append(feat_edif)
 
-                # Cria o Lote usando a geometria individual da edificação
+                # Cria o Lote novo
                 nova_feat_lote = QgsFeature(layer_lotes.fields())
                 nova_feat_lote.setGeometry(feat_edif.geometry()) 
                 if nova_feat_lote.fields().indexOf('sq') != -1: nova_feat_lote['sq'] = str_sq_atual
@@ -229,9 +294,8 @@ def extrair_lotes_e_quadras_por_setor():
                 if nova_feat_lote.fields().indexOf('fid') != -1: nova_feat_lote['fid'] = proximo_fid_lote
                 novas_features_lote.append(nova_feat_lote)
 
-                cod_lf_atual += 1 # Vai para o próximo lote na mesma quadra
+                cod_lf_atual += 1 
 
-            # Incrementa o sequencial da quadra para o próximo grupo
             proximo_qf += 1
 
     # 8. Adiciona os novos polígonos e atualiza as edificações existentes
@@ -255,11 +319,11 @@ def extrair_lotes_e_quadras_por_setor():
 
         iface.messageBar().pushMessage(
             "Sucesso", 
-            f"Processado: {len(novas_features_quadra)} Quadras, {len(novas_features_lote)} Lotes e {len(edificacoes_para_atualizar)} Edificações atualizadas!", 
+            f"Processado: {len(novas_features_quadra)} novas Quadras, {len(novas_features_lote)} novos Lotes e {len(edificacoes_para_atualizar)} Edificações atualizadas!", 
             level=Qgis.Success, 
             duration=7
         )
     else:
-        iface.messageBar().pushMessage("Concluído", "Nenhuma edificação isolada precisou ser alterada.", level=Qgis.Info, duration=5)
+        iface.messageBar().pushMessage("Concluído", "Nenhuma edificação sem lote precisou ser alterada.", level=Qgis.Info, duration=5)
 
 extrair_lotes_e_quadras_por_setor()
