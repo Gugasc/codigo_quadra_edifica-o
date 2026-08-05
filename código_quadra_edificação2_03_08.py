@@ -132,14 +132,37 @@ def extrair_lotes_e_quadras_por_setor():
             feat_edif = layer_edif.getFeature(id_edif)
             geom_edif = feat_edif.geometry()
             
+            # Se você souber o ID dessa edificação específica, coloque assim para testar:
+            if feat_edif['id'] == 556756:
+                print(f"Está dentro do setor? {geom_edif.within(geom_setor)}")
+                
+                toca = any(geom_edif.intersects(layer_lotes.getFeature(id_l).geometry()) for id_l in index_lotes.intersects(geom_edif.boundingBox()))
+                print(f"Toca algum lote? {toca}")
+                print(f"Geometria válida? {geom_edif.isGeosValid()}")
+            
             if not geom_edif.within(geom_setor):
                 continue
                 
             bbox_edif = geom_edif.boundingBox()
 
-            # Descarta se já tocar em Lote existente (pois já tem lote)
-            toca_lote = any(geom_edif.intersects(layer_lotes.getFeature(id_l).geometry()) for id_l in index_lotes.intersects(bbox_edif))
-            if toca_lote: continue
+            # Verifica se toca em um lote, mas com tolerância para bordas
+            toca_lote = False
+            for id_l in index_lotes.intersects(bbox_edif):
+                feat_lote = layer_lotes.getFeature(id_l)
+                geom_lote = feat_lote.geometry()
+                
+                if geom_edif.intersects(geom_lote):
+                    # Cria a geometria da área onde os dois se sobrepõem
+                    area_intersecao = geom_edif.intersection(geom_lote).area()
+                    
+                    #se a área sobreposta for maior que 0.5 metros quadrados, consideramos que já tem lote.
+                    #se for menor, consideramos que não tem lote.
+                    if area_intersecao > 0.5: 
+                        toca_lote = True
+                        break
+
+            if toca_lote: 
+                continue
             
             # Verifica se toca em alguma Quadra existente
             quadras_tocadas = []
