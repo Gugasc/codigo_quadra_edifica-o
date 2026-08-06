@@ -14,9 +14,9 @@ from qgis.PyQt.QtWidgets import QInputDialog
 # ==========================================
 # 1. NOMES DAS CAMADAS NO PROJETO DO QGIS
 # ==========================================
-NOME_CAMADA_EDIF = 'edificacao_fiscal — ct_edificacao_fiscal'
-NOME_CAMADA_LOTES = 'lote_fiscal — ct_lote_fiscal'
-NOME_CAMADA_QUADRAS = 'quadra_fiscal — ct_quadra_fiscal'
+NOME_CAMADA_EDIF = 'ct_edificacao_fiscal'
+NOME_CAMADA_LOTES = 'ct_lote_fiscal'
+NOME_CAMADA_QUADRAS = 'ct_quadra_fiscal'
 NOME_CAMADA_SETORES = 'ct_setor_fiscal'
 
 NOME_CAMPO_SETOR = 'cod_sf' 
@@ -26,17 +26,13 @@ def obter_camada_do_projeto(nome_camada):
     return camadas[0] if camadas else None
 
 def pegar_maior_qf_do_setor(layer, valor_sf_sat):
-    """ Busca o maior cod_qf na camada usando agregador nativo C++ (Muito mais rápido) """
     if layer.fields().indexOf('cod_sf_sat') == -1 or layer.fields().indexOf('cod_qf') == -1:
         return 0
     
     expressao = f'"cod_sf_sat" = \'{valor_sf_sat}\' OR "cod_sf_sat" = {valor_sf_sat}'
-    
-    # Configura os parâmetros de agregação adicionando o filtro
     parametros = QgsAggregateCalculator.AggregateParameters()
     parametros.filter = expressao
     
-    # Executa o agregador com os parâmetros corretos
     max_val, ok = layer.aggregate(QgsAggregateCalculator.Max, 'cod_qf', parametros)
     
     if ok and max_val is not None:
@@ -44,7 +40,6 @@ def pegar_maior_qf_do_setor(layer, valor_sf_sat):
     return 0
 
 def pegar_maior_valor_geral(layer, nome_campo):
-    """ Busca o maior valor de um campo usando agregador nativo """
     if layer.fields().indexOf(nome_campo) == -1:
         return 0
         
@@ -56,7 +51,6 @@ def pegar_maior_valor_geral(layer, nome_campo):
 def extrair_lotes_e_quadras_por_setor():
     project = QgsProject.instance()
     
-    # 2. Carrega as camadas do projeto
     iface.messageBar().pushMessage("Aguarde", "Verificando camadas no projeto...", level=Qgis.Info, duration=2)
     
     layer_edif = obter_camada_do_projeto(NOME_CAMADA_EDIF)
@@ -65,21 +59,19 @@ def extrair_lotes_e_quadras_por_setor():
     layer_setores = obter_camada_do_projeto(NOME_CAMADA_SETORES)
     
     if not all([layer_edif, layer_lotes, layer_quadras, layer_setores]):
-        iface.messageBar().pushMessage("Erro de Camada", "Não foi possível encontrar todas as camadas.", level=Qgis.Critical, duration=7)
+        iface.messageBar().pushMessage("Erro", "Não foi possível encontrar todas as camadas.", level=Qgis.Critical, duration=7)
         return
 
-    # 3. Pede o código do setor fiscal ao usuário
     numero_digitado, ok = QInputDialog.getText(None, "Filtrar Setor", "Digite o código do setor (cod_sf):")
     if not ok or not numero_digitado.strip():
         return
     
-    # 4. Busca o setor fiscal correspondente
     expressao = f'"{NOME_CAMPO_SETOR}" = {numero_digitado}'
     request_setor = QgsFeatureRequest().setFilterExpression(expressao)
     setores = list(layer_setores.getFeatures(request_setor))
     
     if not setores:
-        iface.messageBar().pushMessage("Erro", f"Nenhum setor encontrado.", level=Qgis.Critical, duration=5)
+        iface.messageBar().pushMessage("Erro", "Nenhum setor encontrado.", level=Qgis.Critical, duration=5)
         return
 
     setor_selecionado = setores[0]
@@ -87,57 +79,65 @@ def extrair_lotes_e_quadras_por_setor():
     geom_setor = setor_selecionado.geometry()
     bbox_setor = geom_setor.boundingBox()
 
-    # 5. Descobre os maiores valores existentes
-    iface.messageBar().pushMessage("Aguarde", f"Calculando contadores e identificadores...", level=Qgis.Info, duration=3)
+    iface.messageBar().pushMessage("Aguarde", "Calculando contadores e identificadores...", level=Qgis.Info, duration=3)
     
     maior_qf = max(
         pegar_maior_qf_do_setor(layer_quadras, valor_sf_sat),
         pegar_maior_qf_do_setor(layer_lotes, valor_sf_sat)
     )
     proximo_qf = maior_qf + 1
-
     proximo_id_lote = pegar_maior_valor_geral(layer_lotes, 'id')
     proximo_fid_lote = pegar_maior_valor_geral(layer_lotes, 'fid')
     proximo_id_quadra = pegar_maior_valor_geral(layer_quadras, 'id')
     proximo_fid_quadra = pegar_maior_valor_geral(layer_quadras, 'fid')
 
-    # 6. Criação de Índices Espaciais OTIMIZADA (Apenas o que toca o Bounding Box do Setor)
-    request_bbox = QgsFeatureRequest().setFilterRect(bbox_setor)
+    # =========================================================================
+    # OTIMIZAÇÃO 1: Pré-fetch de Geometrias na memória sem trazer atributos
+    # =========================================================================
+    iface.messageBar().pushMessage("Aguarde", "Criando índices espaciais...", level=Qgis.Info, duration=3)
     
-    index_edif = QgsSpatialIndex(layer_edif.getFeatures(request_bbox)) 
-    index_lotes = QgsSpatialIndex(layer_lotes.getFeatures(request_bbox))
-    index_quadras = QgsSpatialIndex(layer_quadras.getFeatures(request_bbox))
+    # Request que traz APENAS a geometria (muito mais leve para o Banco de Dados)
+    req_geom_only = QgsFeatureRequest().setFilterRect(bbox_setor).setSubsetOfAttributes([])
 
-    # Cache de Índices dos Campos para evitar chamar .indexOf() no loop
-    idx_q_sq = layer_quadras.fields().indexOf('sq')
-    idx_q_sat = layer_quadras.fields().indexOf('cod_sf_sat')
-    idx_q_qf = layer_quadras.fields().indexOf('cod_qf')
-    idx_q_sf = layer_quadras.fields().indexOf('cod_sf')
-    idx_q_id = layer_quadras.fields().indexOf('id')
-    idx_q_fid = layer_quadras.fields().indexOf('fid')
+    # Cache de geometrias de Lotes
+    geoms_lotes = {}
+    index_lotes = QgsSpatialIndex()
+    for feat in layer_lotes.getFeatures(req_geom_only):
+        geoms_lotes[feat.id()] = feat.geometry()
+        index_lotes.addFeature(feat)
 
-    idx_l_sq = layer_lotes.fields().indexOf('sq')
-    idx_l_sql = layer_lotes.fields().indexOf('sql')
-    idx_l_sat = layer_lotes.fields().indexOf('cod_sf_sat')
-    idx_l_qf = layer_lotes.fields().indexOf('cod_qf')
-    idx_l_lf = layer_lotes.fields().indexOf('cod_lf')
-    idx_l_id = layer_lotes.fields().indexOf('id')
-    idx_l_fid = layer_lotes.fields().indexOf('fid')
+    # Cache de geometrias de Quadras
+    geoms_quadras = {}
+    index_quadras = QgsSpatialIndex()
+    for feat in layer_quadras.getFeatures(req_geom_only):
+        geoms_quadras[feat.id()] = feat.geometry()
+        index_quadras.addFeature(feat)
 
+    # Para edificações, precisamos das geometrias e dos atributos específicos para atualizar
     idx_e_sql = layer_edif.fields().indexOf('sql')
     idx_e_sqle = layer_edif.fields().indexOf('sqle')
     idx_e_ef = layer_edif.fields().indexOf('cod_ef')
+    
+    req_edif = QgsFeatureRequest().setFilterRect(bbox_setor).setSubsetOfAttributes([idx_e_sql, idx_e_sqle, idx_e_ef])
+    edificacoes_in_bbox = {}
+    index_edif = QgsSpatialIndex()
+    
+    for feat in layer_edif.getFeatures(req_edif):
+        edificacoes_in_bbox[feat.id()] = feat
+        index_edif.addFeature(feat)
 
-    novas_features_lote = []
-    novas_features_quadra = []
-    edificacoes_para_atualizar = [] 
+    # Cache de Índices dos Campos
+    idx_q_sq, idx_q_sat, idx_q_qf, idx_q_sf, idx_q_id, idx_q_fid = [layer_quadras.fields().indexOf(f) for f in ['sq', 'cod_sf_sat', 'cod_qf', 'cod_sf', 'id', 'fid']]
+    idx_l_sq, idx_l_sql, idx_l_sat, idx_l_qf, idx_l_lf, idx_l_id, idx_l_fid = [layer_lotes.fields().indexOf(f) for f in ['sq', 'sql', 'cod_sf_sat', 'cod_qf', 'cod_lf', 'id', 'fid']]
 
     ids_edificacoes_no_setor = index_edif.intersects(bbox_setor)
     edificacoes_isoladas = {}
     
-    # 7. Coleta apenas edificações que não tocam lotes/quadras
+    # =========================================================================
+    # OTIMIZAÇÃO 2: Verificações 100% na memória Ram (Sem bater no DB)
+    # =========================================================================
     for id_edif in ids_edificacoes_no_setor:
-        feat_edif = layer_edif.getFeature(id_edif)
+        feat_edif = edificacoes_in_bbox[id_edif]
         geom_edif = feat_edif.geometry()
         
         if not geom_edif.within(geom_setor):
@@ -145,16 +145,16 @@ def extrair_lotes_e_quadras_por_setor():
             
         bbox_edif = geom_edif.boundingBox()
 
-        # Descarta se já tocar em Lote ou Quadra existente
-        toca_lote = any(geom_edif.intersects(layer_lotes.getFeature(id_l).geometry()) for id_l in index_lotes.intersects(bbox_edif))
+        # Checa interseções consultando o dicionário RAM, não o DB
+        toca_lote = any(geom_edif.intersects(geoms_lotes[id_l]) for id_l in index_lotes.intersects(bbox_edif))
         if toca_lote: continue
         
-        toca_quadra = any(geom_edif.intersects(layer_quadras.getFeature(id_q).geometry()) for id_q in index_quadras.intersects(bbox_edif))
+        toca_quadra = any(geom_edif.intersects(geoms_quadras[id_q]) for id_q in index_quadras.intersects(bbox_edif))
         if toca_quadra: continue
 
         edificacoes_isoladas[id_edif] = feat_edif
 
-    # 8. Agrupa as edificações que se tocam (Otimizado com Índice Espacial Local)
+    # 8. Agrupa as edificações que se tocam
     index_isoladas = QgsSpatialIndex()
     for feat in edificacoes_isoladas.values():
         index_isoladas.addFeature(feat)
@@ -173,7 +173,6 @@ def extrair_lotes_e_quadras_por_setor():
             atual = fila.pop(0)
             geom_atual = atual.geometry()
             
-            # Checa interseções apenas com vizinhos próximos usando o índice temporário
             vizinhos_ids = index_isoladas.intersects(geom_atual.boundingBox())
             for v_id in vizinhos_ids:
                 if v_id not in visitados:
@@ -185,9 +184,14 @@ def extrair_lotes_e_quadras_por_setor():
         
         grupos.append(grupo_atual)
 
-    # 9. Criação de Quadras e Lotes
+    # 9. Criação de Quadras, Lotes e Mapeamento de Atualizações
     str_sf_sat = str(valor_sf_sat).zfill(3)
+    novas_features_lote = []
+    novas_features_quadra = []
     
+    # OTIMIZAÇÃO 3: Dicionário para atualização em lote
+    mapa_edificacoes_para_atualizar = {}
+
     for grupo in grupos:
         geom_combinada = QgsGeometry(grupo[0].geometry())
         for feat in grupo[1:]:
@@ -219,10 +223,13 @@ def extrair_lotes_e_quadras_por_setor():
             str_sql_atual = f"{str_sq_atual}{str_lf_atual}"
             str_sqle_atual = f"{str_sql_atual}01"
 
-            if idx_e_sql != -1: feat_edif[idx_e_sql] = str_sql_atual
-            if idx_e_sqle != -1: feat_edif[idx_e_sqle] = str_sqle_atual
-            if idx_e_ef != -1: feat_edif[idx_e_ef] = 1
-            edificacoes_para_atualizar.append(feat_edif)
+            # Registra no dicionário apenas os campos que vão mudar
+            atributos_novos = {}
+            if idx_e_sql != -1: atributos_novos[idx_e_sql] = str_sql_atual
+            if idx_e_sqle != -1: atributos_novos[idx_e_sqle] = str_sqle_atual
+            if idx_e_ef != -1: atributos_novos[idx_e_ef] = 1
+            
+            mapa_edificacoes_para_atualizar[feat_edif.id()] = atributos_novos
 
             nova_feat_lote = QgsFeature(layer_lotes.fields())
             nova_feat_lote.setGeometry(feat_edif.geometry()) 
@@ -240,8 +247,10 @@ def extrair_lotes_e_quadras_por_setor():
             
         proximo_qf += 1
 
-    # 10. Salva as edições
-    if novas_features_lote or novas_features_quadra or edificacoes_para_atualizar:
+    # =========================================================================
+    # 10. Inicia a edição na memória
+    # =========================================================================
+    if novas_features_lote or novas_features_quadra or mapa_edificacoes_para_atualizar:
         
         if novas_features_lote:
             layer_lotes.startEditing()
@@ -253,16 +262,17 @@ def extrair_lotes_e_quadras_por_setor():
             layer_quadras.addFeatures(novas_features_quadra)
             layer_quadras.triggerRepaint()
 
-        if edificacoes_para_atualizar:
+        if mapa_edificacoes_para_atualizar:
             layer_edif.startEditing()
-            # updateFeatures() em lote (batch) é mais eficiente que um loop de updateFeature()
-            for feat in edificacoes_para_atualizar:
-                layer_edif.updateFeature(feat) 
+            for fid, atributos in mapa_edificacoes_para_atualizar.items():
+                for idx_campo, novo_valor in atributos.items():
+                    layer_edif.changeAttributeValue(fid, idx_campo, novo_valor)
+                    
             layer_edif.triggerRepaint()
 
         iface.messageBar().pushMessage(
             "Sucesso", 
-            f"Processado: {len(novas_features_quadra)} Quadras, {len(novas_features_lote)} Lotes e {len(edificacoes_para_atualizar)} Edificações atualizadas!", 
+            f"Processado: {len(novas_features_quadra)} Quadras, {len(novas_features_lote)} Lotes e {len(mapa_edificacoes_para_atualizar)} Edificações atualizadas!", 
             level=Qgis.Success, 
             duration=7
         )
