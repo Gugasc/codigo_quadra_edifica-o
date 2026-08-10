@@ -41,7 +41,7 @@ def extrair_lotes_por_quadra_existente():
     numero_digitado, ok = QInputDialog.getText(None, "Filtrar Setor", "Digite o código do setor (cod_sf):")
     if not ok or not numero_digitado.strip():
         return
-        
+    print(f"Número do Setor: {numero_digitado}")    
     expressao = f'"{NOME_CAMPO_SETOR}" = {numero_digitado}'
     request_setor = QgsFeatureRequest().setFilterExpression(expressao)
     setores = list(layer_setores.getFeatures(request_setor))
@@ -59,6 +59,8 @@ def extrair_lotes_por_quadra_existente():
     # Pegando os índices dos campos
     idx_q_sq, idx_q_sat, idx_q_qf = [layer_quadras.fields().indexOf(f) for f in ['sq', 'cod_sf_sat', 'cod_qf']]
     idx_l_sq, idx_l_sql, idx_l_sat, idx_l_qf, idx_l_lf = [layer_lotes.fields().indexOf(f) for f in ['sq', 'sql', 'cod_sf_sat', 'cod_qf', 'cod_lf']]
+    
+    # Mantemos o índice do sqle aqui apenas para verificar se ele já está preenchido
     idx_e_sql, idx_e_sqle = [layer_edif.fields().indexOf(f) for f in ['sql', 'sqle']]
 
     # Cache de Quadras
@@ -171,11 +173,13 @@ def extrair_lotes_por_quadra_existente():
             # Gera as strings de código (Garante SQL com 10 caracteres)
             str_lf_atual = str(cod_lf_atual).zfill(3)
             str_sql_atual = f"{str_sq}{str_lf_atual}"
-            str_sqle_atual = f"{str_sql_atual}01"
+            
+            # REMOVIDA A CRIAÇÃO DO SQLE (str_sqle_atual) AQUI
 
             atributos_novos = {}
             if idx_e_sql != -1: atributos_novos[idx_e_sql] = str_sql_atual
-            if idx_e_sqle != -1: atributos_novos[idx_e_sqle] = str_sqle_atual
+            
+            # REMOVIDA A ATRIBUIÇÃO DO SQLE NO DICIONÁRIO AQUI
             
             mapa_edificacoes_para_atualizar[feat_edif.id()] = atributos_novos
 
