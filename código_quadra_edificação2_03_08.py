@@ -173,13 +173,9 @@ def extrair_lotes_por_quadra_existente():
             # Gera as strings de código (Garante SQL com 10 caracteres)
             str_lf_atual = str(cod_lf_atual).zfill(3)
             str_sql_atual = f"{str_sq}{str_lf_atual}"
-            
-            # REMOVIDA A CRIAÇÃO DO SQLE (str_sqle_atual) AQUI
 
             atributos_novos = {}
             if idx_e_sql != -1: atributos_novos[idx_e_sql] = str_sql_atual
-            
-            # REMOVIDA A ATRIBUIÇÃO DO SQLE NO DICIONÁRIO AQUI
             
             mapa_edificacoes_para_atualizar[feat_edif.id()] = atributos_novos
 
