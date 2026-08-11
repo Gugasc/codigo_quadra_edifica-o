@@ -171,7 +171,7 @@ def extrair_lotes_por_quadra_existente():
         for feat_edif in lista_edif:
 
             # Gera as strings de código (Garante SQL com 10 caracteres)
-            str_lf_atual = str(cod_lf_atual).zfill(3)
+            str_lf_atual = str(cod_lf_atual).zfill(4)
             str_sql_atual = f"{str_sq}{str_lf_atual}"
 
             atributos_novos = {}
