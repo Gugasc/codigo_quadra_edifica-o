@@ -14,9 +14,9 @@ from qgis.PyQt.QtWidgets import QInputDialog
 # ==========================================
 # 1. NOMES DAS CAMADAS NO PROJETO DO QGIS
 # ==========================================
-NOME_CAMADA_EDIF = 'ct_edificacao_fiscal'
-NOME_CAMADA_LOTES = 'ct_lote_fiscal'
-NOME_CAMADA_QUADRAS = 'ct_quadra_fiscal'
+NOME_CAMADA_EDIF = 'edificacao_fiscal — ct_edificacao_fiscal'
+NOME_CAMADA_LOTES = 'lote_fiscal — ct_lote_fiscal'
+NOME_CAMADA_QUADRAS = 'quadra_fiscal — ct_quadra_fiscal'
 NOME_CAMADA_SETORES = 'ct_setor_fiscal'
 
 NOME_CAMPO_SETOR = 'cod_sf'
@@ -114,21 +114,37 @@ def extrair_lotes_por_quadra_existente():
         val_sql = feat_edif.attribute(idx_e_sql)
         val_sqle = feat_edif.attribute(idx_e_sqle)
         
+        #.strip() serve para remover todos os espaços em branco em textos
         sql_preenchido = val_sql not in (None, NULL) and str(val_sql).strip() != ''
         sqle_preenchido = val_sqle not in (None, NULL) and str(val_sqle).strip() != ''
         
+        #verifica se a edificação já possui um lote vinculado a ele
         if sql_preenchido or sqle_preenchido:
             continue
             
         geom_edif = feat_edif.geometry()
         
+        #garante que se a forma criada está dentro do setor analisado
         if not geom_edif.within(geom_setor):
             continue
             
         bbox_edif = geom_edif.boundingBox()
 
-        # 2. O local não pode ter um Lote já desenhado
-        toca_lote = any(geom_edif.intersects(lotes_in_bbox[id_l].geometry()) for id_l in index_lotes.intersects(bbox_edif))
+        # 2. O local não pode ter um Lote já desenhado (Evita sobreposição, mas permite toque)
+        toca_lote = False
+        for id_l in index_lotes.intersects(bbox_edif):
+            geom_lote_exist = lotes_in_bbox[id_l].geometry()
+            
+            # Se as geometrias se interceptam, vamos checar a natureza dessa interseção
+            if geom_edif.intersects(geom_lote_exist):
+                intersecao = geom_edif.intersection(geom_lote_exist)
+                
+                # Se a área da interseção for maior que uma pequena tolerância (ex: 0.01 m²), 
+                # consideramos que é uma sobreposição real, e não apenas um toque de borda.
+                if intersecao.area() > 0.01:
+                    toca_lote = True
+                    break
+        
         if toca_lote: 
             continue
 
@@ -170,10 +186,11 @@ def extrair_lotes_por_quadra_existente():
 
         for feat_edif in lista_edif:
 
-            # Gera as strings de código (Garante SQL com 10 caracteres)
+            # Gera as strings de código (Garante SQL com 11 caracteres)
             str_lf_atual = str(cod_lf_atual).zfill(4)
+            print(f"Código lf atual: {str_lf_atual}")
             str_sql_atual = f"{str_sq}{str_lf_atual}"
-
+            print(f"Código sql atual: {str_sql_atual} \n")
             atributos_novos = {}
             if idx_e_sql != -1: atributos_novos[idx_e_sql] = str_sql_atual
             
