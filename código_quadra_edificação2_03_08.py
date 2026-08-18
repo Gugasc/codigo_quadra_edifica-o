@@ -14,9 +14,9 @@ from qgis.PyQt.QtWidgets import QInputDialog
 # ==========================================
 # 1. NOMES DAS CAMADAS NO PROJETO DO QGIS
 # ==========================================
-NOME_CAMADA_EDIF = 'edificacao_fiscal — ct_edificacao_fiscal'
-NOME_CAMADA_LOTES = 'lote_fiscal — ct_lote_fiscal'
-NOME_CAMADA_QUADRAS = 'quadra_fiscal — ct_quadra_fiscal'
+NOME_CAMADA_EDIF = 'ct_edificacao_fiscal'
+NOME_CAMADA_LOTES = 'ct_lote_fiscal'
+NOME_CAMADA_QUADRAS = 'ct_quadra_fiscal'
 NOME_CAMADA_SETORES = 'ct_setor_fiscal'
 
 NOME_CAMPO_SETOR = 'cod_sf'
@@ -56,13 +56,11 @@ def extrair_lotes_por_quadra_existente():
 
     iface.messageBar().pushMessage("Aguarde", "Criando índices espaciais...", level=Qgis.Info, duration=3)
 
-    # Pegando os índices dos campos
     idx_q_sq, idx_q_sat, idx_q_qf = [layer_quadras.fields().indexOf(f) for f in ['sq', 'cod_sf_sat', 'cod_qf']]
     idx_l_sq, idx_l_sql, idx_l_sat, idx_l_qf, idx_l_lf = [layer_lotes.fields().indexOf(f) for f in ['sq', 'sql', 'cod_sf_sat', 'cod_qf', 'cod_lf']]
-    
     idx_e_sql, idx_e_sqle = [layer_edif.fields().indexOf(f) for f in ['sql', 'sqle']]
 
-    # Cache de Quadras
+    # Caches
     req_quadras = QgsFeatureRequest().setFilterRect(bbox_setor).setSubsetOfAttributes([idx_q_sq, idx_q_sat, idx_q_qf])
     quadras_in_bbox = {}
     index_quadras = QgsSpatialIndex()
@@ -70,8 +68,7 @@ def extrair_lotes_por_quadra_existente():
         quadras_in_bbox[feat.id()] = feat
         index_quadras.addFeature(feat)
 
-    # Cache de Lotes Existentes
-    req_lotes = QgsFeatureRequest().setFilterRect(bbox_setor).setSubsetOfAttributes([idx_l_sq, idx_l_lf])
+    req_lotes = QgsFeatureRequest().setFilterRect(bbox_setor).setSubsetOfAttributes([idx_l_sq, idx_l_sql, idx_l_lf])
     lotes_in_bbox = {}
     index_lotes = QgsSpatialIndex()
     
@@ -90,7 +87,6 @@ def extrair_lotes_por_quadra_existente():
             except ValueError:
                 pass
 
-    # Cache de Edificações
     req_edif = QgsFeatureRequest().setFilterRect(bbox_setor).setSubsetOfAttributes([idx_e_sql, idx_e_sqle])
     edificacoes_in_bbox = {}
     index_edif = QgsSpatialIndex()
@@ -101,6 +97,7 @@ def extrair_lotes_por_quadra_existente():
     ids_edificacoes_no_setor = index_edif.intersects(bbox_setor)
     
     edificacoes_por_quadra = {}
+    mapa_edificacoes_para_atualizar = {} # Movido para cá para guardar heranças diretas
     
     # =========================================================================
     # Regras de Negócio Espaciais
@@ -125,24 +122,39 @@ def extrair_lotes_por_quadra_existente():
         bbox_edif = geom_edif.boundingBox()
 
         # 2. Verifica contato ou sobreposição com Lotes já desenhados
-        sobrepoe_lote = False
+        sobrepoe_lote_invalido = False
         lotes_adjacentes = []
+        lote_pai = None # Guarda o lote se a edificação estiver 100% dentro dele
         
         for id_l in index_lotes.intersects(bbox_edif):
-            geom_lote_exist = lotes_in_bbox[id_l].geometry()
+            feat_lote_exist = lotes_in_bbox[id_l]
+            geom_lote_exist = feat_lote_exist.geometry()
             
-            if geom_edif.intersects(geom_lote_exist):
+            # NOVIDADE: A edificação está perfeitamente contida em um lote existente?
+            if geom_edif.within(geom_lote_exist):
+                lote_pai = feat_lote_exist
+                break # Encontrou o dono, não precisa checar mais
+                
+            elif geom_edif.intersects(geom_lote_exist):
                 intersecao = geom_edif.intersection(geom_lote_exist)
                 
-                # Se a área for considerável, é sobreposição
+                # Se for sobreposição parcial (não está 100% dentro, mas invade o espaço)
                 if intersecao.area() > 0.01:
-                    sobrepoe_lote = True
+                    sobrepoe_lote_invalido = True
                     break
                 else:
                     # É apenas um toque nas bordas
-                    lotes_adjacentes.append(lotes_in_bbox[id_l])
+                    lotes_adjacentes.append(feat_lote_exist)
         
-        if sobrepoe_lote: 
+        # Se achou um lote pai, herda o SQL dele e vai para a próxima edificação
+        if lote_pai:
+            sql_herdado = lote_pai.attribute(idx_l_sql)
+            if sql_herdado not in (None, NULL) and idx_e_sql != -1:
+                mapa_edificacoes_para_atualizar[feat_edif.id()] = {idx_e_sql: sql_herdado}
+            continue
+
+        # Se sobrepõe de forma irregular (metade dentro, metade fora de um lote), ignora
+        if sobrepoe_lote_invalido: 
             continue
 
         # 3. Descobrir a qual Quadra essa edificação pertence
@@ -153,11 +165,9 @@ def extrair_lotes_por_quadra_existente():
         
         quadra_valida = None
         
-        # Cenário A: Está 100% dentro de uma única quadra
         if len(quadras_contendo) == 1:
             quadra_valida = quadras_contendo[0]
             
-        # Cenário B: Está fora das quadras, mas toca em lote(s) existente(s)
         elif len(quadras_contendo) == 0 and len(lotes_adjacentes) > 0:
             for lote_adj in lotes_adjacentes:
                 sq_lote = lote_adj.attribute(idx_l_sq)
@@ -181,8 +191,7 @@ def extrair_lotes_por_quadra_existente():
     # Criação de Lotes, Expansão de Quadras e Mapeamento de Atualizações
     # =========================================================================
     novas_features_lote = []
-    mapa_edificacoes_para_atualizar = {}
-    mapa_quadras_para_atualizar = {} # Rastreia a expansão das quadras
+    mapa_quadras_para_atualizar = {}
 
     wkb_lotes = layer_lotes.wkbType()
     is_multi_lote = QgsWkbTypes.isMultiType(wkb_lotes)
@@ -199,12 +208,13 @@ def extrair_lotes_por_quadra_existente():
             
         cod_lf_atual = max_lf_dict.get(str_sq, 0) + 1
         
-        # Pega a geometria atual da quadra (caso ela já tenha crescido neste processamento)
         geom_quadra_atual = mapa_quadras_para_atualizar.get(q_id, QgsGeometry(quadra.geometry()))
 
         for feat_edif in lista_edif:
             str_lf_atual = str(cod_lf_atual).zfill(4)
-            str_sql_atual = f"{str_sq}{str_lf_atual}"
+            print(f"Código lf atual: {str_lf_atual}")
+            str_sql_atual = f"{str_sq}{str_lf_atual} \n"
+            print(f"Código sql atual: {str_sql_atual} \n")
             
             atributos_novos = {}
             if idx_e_sql != -1: atributos_novos[idx_e_sql] = str_sql_atual
@@ -213,8 +223,6 @@ def extrair_lotes_por_quadra_existente():
 
             geom_lote = QgsGeometry(feat_edif.geometry())
 
-            # --- EXPANSÃO DA QUADRA ---
-            # Combina (Union) a forma atual da quadra com o polígono do novo lote gerado
             geom_quadra_atual = geom_quadra_atual.combine(geom_lote)
 
             if is_multi_lote and not geom_lote.isMultipart():
@@ -228,7 +236,6 @@ def extrair_lotes_por_quadra_existente():
                         geom_simples_l = part
                 geom_lote = geom_simples_l
 
-            # Prepara a feição do NOVO LOTE (separado do lote adjacente)
             nova_feat_lote = QgsFeature(layer_lotes.fields())
             nova_feat_lote.setGeometry(geom_lote)
             
@@ -241,7 +248,6 @@ def extrair_lotes_por_quadra_existente():
 
             cod_lf_atual += 1
             
-        # Salva a geometria expandida da quadra para aplicar no final
         mapa_quadras_para_atualizar[q_id] = geom_quadra_atual
 
     # =========================================================================
@@ -249,13 +255,11 @@ def extrair_lotes_por_quadra_existente():
     # =========================================================================
     if novas_features_lote or mapa_edificacoes_para_atualizar or mapa_quadras_para_atualizar:
         
-        # 1. Adiciona os Lotes Novos
         if novas_features_lote:
             layer_lotes.startEditing()
             layer_lotes.addFeatures(novas_features_lote)
             layer_lotes.triggerRepaint()
 
-        # 2. Atualiza os Atributos das Edificações
         if mapa_edificacoes_para_atualizar:
             layer_edif.startEditing()
             for fid, atributos in mapa_edificacoes_para_atualizar.items():
@@ -263,7 +267,6 @@ def extrair_lotes_por_quadra_existente():
                     layer_edif.changeAttributeValue(fid, idx_campo, novo_valor)
             layer_edif.triggerRepaint()
             
-        # 3. Atualiza a Geometria (Expansão) das Quadras
         if mapa_quadras_para_atualizar:
             layer_quadras.startEditing()
             for q_id, nova_geom in mapa_quadras_para_atualizar.items():
@@ -272,11 +275,11 @@ def extrair_lotes_por_quadra_existente():
 
         iface.messageBar().pushMessage(
             "Sucesso",
-            f"Processado: {len(novas_features_lote)} Lotes criados, limites de {len(mapa_quadras_para_atualizar)} Quadra(s) expandidos!",
+            f"Processado: {len(novas_features_lote)} Lotes criados, {len(mapa_edificacoes_para_atualizar)} Edificações atualizadas (incluindo heranças) e {len(mapa_quadras_para_atualizar)} Quadra(s) expandida(s)!",
             level=Qgis.Success,
             duration=7
         )
     else:
-        iface.messageBar().pushMessage("Concluído", "Nenhuma edificação atendeu aos critérios para criar lote e expandir quadra.", level=Qgis.Info, duration=5)
+        iface.messageBar().pushMessage("Concluído", "Nenhuma edificação atendeu aos critérios para criar lote ou atualizar SQL.", level=Qgis.Info, duration=5)
 
 extrair_lotes_por_quadra_existente()
