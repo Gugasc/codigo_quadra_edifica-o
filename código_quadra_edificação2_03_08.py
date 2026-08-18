@@ -97,7 +97,7 @@ def extrair_lotes_por_quadra_existente():
     ids_edificacoes_no_setor = index_edif.intersects(bbox_setor)
     
     edificacoes_por_quadra = {}
-    mapa_edificacoes_para_atualizar = {} # Movido para cá para guardar heranças diretas
+    mapa_edificacoes_para_atualizar = {}
     
     # =========================================================================
     # Regras de Negócio Espaciais
@@ -124,44 +124,48 @@ def extrair_lotes_por_quadra_existente():
         # 2. Verifica contato ou sobreposição com Lotes já desenhados
         sobrepoe_lote_invalido = False
         lotes_adjacentes = []
-        lote_pai = None # Guarda o lote se a edificação estiver 100% dentro dele
+        lote_pai = None 
         
         for id_l in index_lotes.intersects(bbox_edif):
             feat_lote_exist = lotes_in_bbox[id_l]
             geom_lote_exist = feat_lote_exist.geometry()
             
-            # NOVIDADE: A edificação está perfeitamente contida em um lote existente?
             if geom_edif.within(geom_lote_exist):
                 lote_pai = feat_lote_exist
-                break # Encontrou o dono, não precisa checar mais
+                break
                 
             elif geom_edif.intersects(geom_lote_exist):
                 intersecao = geom_edif.intersection(geom_lote_exist)
-                
-                # Se for sobreposição parcial (não está 100% dentro, mas invade o espaço)
                 if intersecao.area() > 0.01:
                     sobrepoe_lote_invalido = True
                     break
                 else:
-                    # É apenas um toque nas bordas
                     lotes_adjacentes.append(feat_lote_exist)
         
-        # Se achou um lote pai, herda o SQL dele e vai para a próxima edificação
         if lote_pai:
             sql_herdado = lote_pai.attribute(idx_l_sql)
             if sql_herdado not in (None, NULL) and idx_e_sql != -1:
                 mapa_edificacoes_para_atualizar[feat_edif.id()] = {idx_e_sql: sql_herdado}
             continue
 
-        # Se sobrepõe de forma irregular (metade dentro, metade fora de um lote), ignora
         if sobrepoe_lote_invalido: 
             continue
 
         # 3. Descobrir a qual Quadra essa edificação pertence
         quadras_contendo = []
+        quadras_intersectadas_parcialmente = []
+        
         for id_q in index_quadras.intersects(bbox_edif):
-            if geom_edif.within(quadras_in_bbox[id_q].geometry()):
-                quadras_contendo.append(quadras_in_bbox[id_q])
+            feat_q = quadras_in_bbox[id_q]
+            geom_q = feat_q.geometry()
+            
+            if geom_edif.within(geom_q):
+                quadras_contendo.append(feat_q)
+            elif geom_edif.intersects(geom_q):
+                intersecao_q = geom_edif.intersection(geom_q)
+                # Verifica se a invasão é significativa (não apenas um toque mínimo de borda)
+                if intersecao_q.area() > 0.01:
+                    quadras_intersectadas_parcialmente.append(feat_q)
         
         quadra_valida = None
         
@@ -181,6 +185,18 @@ def extrair_lotes_por_quadra_existente():
 
         if not quadra_valida:
             continue 
+
+        # Trava de segurança para invasão de outras quadras
+        invade_quadra_errada = False
+        for feat_q_invadida in quadras_intersectadas_parcialmente:
+            # Se a edificação sobrepõe uma quadra diferente daquela que ela vai pertencer
+            if feat_q_invadida.id() != quadra_valida.id():
+                invade_quadra_errada = True
+                break
+                
+        if invade_quadra_errada:
+            continue # Desiste de processar essa edificação
+        # ----------------------------------------------------------
 
         q_id = quadra_valida.id()
         if q_id not in edificacoes_por_quadra:
@@ -212,9 +228,7 @@ def extrair_lotes_por_quadra_existente():
 
         for feat_edif in lista_edif:
             str_lf_atual = str(cod_lf_atual).zfill(4)
-            print(f"Código lf atual: {str_lf_atual}")
-            str_sql_atual = f"{str_sq}{str_lf_atual} \n"
-            print(f"Código sql atual: {str_sql_atual} \n")
+            str_sql_atual = f"{str_sq}{str_lf_atual}"
             
             atributos_novos = {}
             if idx_e_sql != -1: atributos_novos[idx_e_sql] = str_sql_atual
@@ -275,11 +289,11 @@ def extrair_lotes_por_quadra_existente():
 
         iface.messageBar().pushMessage(
             "Sucesso",
-            f"Processado: {len(novas_features_lote)} Lotes criados, {len(mapa_edificacoes_para_atualizar)} Edificações atualizadas (incluindo heranças) e {len(mapa_quadras_para_atualizar)} Quadra(s) expandida(s)!",
+            f"Processado: {len(novas_features_lote)} Lotes criados, {len(mapa_edificacoes_para_atualizar)} Edif. atualizadas e {len(mapa_quadras_para_atualizar)} Quadra(s) expandida(s)!",
             level=Qgis.Success,
             duration=7
         )
     else:
-        iface.messageBar().pushMessage("Concluído", "Nenhuma edificação atendeu aos critérios para criar lote ou atualizar SQL.", level=Qgis.Info, duration=5)
+        iface.messageBar().pushMessage("Concluído", "Nenhuma edificação atendeu aos critérios estabelecidos.", level=Qgis.Info, duration=5)
 
 extrair_lotes_por_quadra_existente()
