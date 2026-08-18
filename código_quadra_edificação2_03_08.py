@@ -297,3 +297,9 @@ def extrair_lotes_por_quadra_existente():
         iface.messageBar().pushMessage("Concluído", "Nenhuma edificação atendeu aos critérios estabelecidos.", level=Qgis.Info, duration=5)
 
 extrair_lotes_por_quadra_existente()
+
+'''
+Quadras já irregulares: O código funde a geometria do lote à quadra (combine). Se a geometria original da quadra (antes de rodar o script) já estivesse vazando 
+para fora do setor fiscal, ela continuará vazando. O script não corta a quadra para caber no setor; 
+ele apenas garante que o "puxadinho" (novo lote) que está sendo anexado a ela está dentro do setor.
+'''
