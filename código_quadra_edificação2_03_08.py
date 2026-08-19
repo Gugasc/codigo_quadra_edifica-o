@@ -116,6 +116,7 @@ def extrair_lotes_por_quadra_existente():
             
         geom_edif = feat_edif.geometry()
         
+        # Evita que o novo desenho ultrapasse o setor fiscal indicado
         if not geom_edif.within(geom_setor):
             continue
             
@@ -142,7 +143,7 @@ def extrair_lotes_por_quadra_existente():
                 else:
                     lotes_adjacentes.append(feat_lote_exist)
         
-        if lote_pai:
+        if lote_pai: # Caso a edificação esteja totalmente dentro de um lote, mas não possua SQL
             sql_herdado = lote_pai.attribute(idx_l_sql)
             if sql_herdado not in (None, NULL) and idx_e_sql != -1:
                 mapa_edificacoes_para_atualizar[feat_edif.id()] = {idx_e_sql: sql_herdado}
@@ -196,7 +197,11 @@ def extrair_lotes_por_quadra_existente():
                 
         if invade_quadra_errada:
             continue # Desiste de processar essa edificação
-        # ----------------------------------------------------------
+
+        geom_q_valida = quadra_valida.geometry()
+        # Faz com que se a quadra não estiver dentro do setor, ela será ignorada
+        if not geom_q_valida.within(geom_setor):
+            continue
 
         q_id = quadra_valida.id()
         if q_id not in edificacoes_por_quadra:
@@ -226,13 +231,14 @@ def extrair_lotes_por_quadra_existente():
         
         geom_quadra_atual = mapa_quadras_para_atualizar.get(q_id, QgsGeometry(quadra.geometry()))
 
-        for feat_edif in lista_edif:
+        for feat_edif in lista_edif: 
             str_lf_atual = str(cod_lf_atual).zfill(4)
-            str_sql_atual = f"{str_sq}{str_lf_atual}"
+            str_sql_atual = f"{str_sq}{str_lf_atual}" # Cria um novo lote e SQL
             
             atributos_novos = {}
             if idx_e_sql != -1: atributos_novos[idx_e_sql] = str_sql_atual
             
+            # Salva o novo SQL para atualizar a edificação
             mapa_edificacoes_para_atualizar[feat_edif.id()] = atributos_novos
 
             geom_lote = QgsGeometry(feat_edif.geometry())
@@ -297,9 +303,3 @@ def extrair_lotes_por_quadra_existente():
         iface.messageBar().pushMessage("Concluído", "Nenhuma edificação atendeu aos critérios estabelecidos.", level=Qgis.Info, duration=5)
 
 extrair_lotes_por_quadra_existente()
-
-'''
-Quadras já irregulares: O código funde a geometria do lote à quadra (combine). Se a geometria original da quadra (antes de rodar o script) já estivesse vazando 
-para fora do setor fiscal, ela continuará vazando. O script não corta a quadra para caber no setor; 
-ele apenas garante que o "puxadinho" (novo lote) que está sendo anexado a ela está dentro do setor.
-'''
