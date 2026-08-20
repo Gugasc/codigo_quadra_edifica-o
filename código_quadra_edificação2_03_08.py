@@ -63,10 +63,15 @@ def extrair_lotes_por_quadra_existente():
     # Caches
     req_quadras = QgsFeatureRequest().setFilterRect(bbox_setor).setSubsetOfAttributes([idx_q_sq, idx_q_sat, idx_q_qf])
     quadras_in_bbox = {}
+    mapa_quadras_por_sq = {} 
     index_quadras = QgsSpatialIndex()
     for feat in layer_quadras.getFeatures(req_quadras):
         quadras_in_bbox[feat.id()] = feat
         index_quadras.addFeature(feat)
+        
+        sq = feat.attribute(idx_q_sq)
+        if sq not in (None, NULL):
+            mapa_quadras_por_sq[sq] = feat
 
     req_lotes = QgsFeatureRequest().setFilterRect(bbox_setor).setSubsetOfAttributes([idx_l_sq, idx_l_sql, idx_l_lf])
     lotes_in_bbox = {}
@@ -116,10 +121,37 @@ def extrair_lotes_por_quadra_existente():
             
         geom_edif = feat_edif.geometry()
         
+        # Validação extra para evitar que geometria corrompida trave o PostGIS
+        if not geom_edif.isGeosValid():
+            print(f"Edificação ID {feat_edif.id()} ignorada: Geometria inválida/corrompida.")
+            continue
+        
+        # Evita que o novo desenho ultrapasse o setor fiscal indicado
         if not geom_edif.within(geom_setor):
             continue
             
         bbox_edif = geom_edif.boundingBox()
+
+        # ---------------------------------------------------------------------
+        # NOVA TRAVA: Edificação vs Edificação (Validação Topológica)
+        # ---------------------------------------------------------------------
+        sobrepoe_outra_edificacao = False
+        for id_outra in index_edif.intersects(bbox_edif):
+            if id_outra == feat_edif.id(): 
+                continue
+                
+            feat_outra = edificacoes_in_bbox[id_outra]
+            geom_outra = feat_outra.geometry()
+            
+            # Se intersecta, mas NÃO é apenas um toque de linha de borda = SOBREPOSIÇÃO REAL
+            if geom_edif.intersects(geom_outra) and not geom_edif.touches(geom_outra):
+                sobrepoe_outra_edificacao = True
+                break
+                    
+        if sobrepoe_outra_edificacao:
+            #print(f"Edificação ID {feat_edif.id()} ignorada: Sobrepõe outra edificação.")
+            continue
+        # ---------------------------------------------------------------------
 
         # 2. Verifica contato ou sobreposição com Lotes já desenhados
         sobrepoe_lote_invalido = False
@@ -135,20 +167,22 @@ def extrair_lotes_por_quadra_existente():
                 break
                 
             elif geom_edif.intersects(geom_lote_exist):
-                intersecao = geom_edif.intersection(geom_lote_exist)
-                if intersecao.area() > 0.01:
+                # Usando o mesmo princípio topológico seguro
+                if not geom_edif.touches(geom_lote_exist):
                     sobrepoe_lote_invalido = True
                     break
                 else:
+                    # Eles apenas dividem muro, o que é totalmente permitido
                     lotes_adjacentes.append(feat_lote_exist)
         
-        if lote_pai:
+        if lote_pai: # Caso a edificação esteja totalmente dentro de um lote, mas não possua SQL
             sql_herdado = lote_pai.attribute(idx_l_sql)
             if sql_herdado not in (None, NULL) and idx_e_sql != -1:
                 mapa_edificacoes_para_atualizar[feat_edif.id()] = {idx_e_sql: sql_herdado}
             continue
 
         if sobrepoe_lote_invalido: 
+            print(f"Edificação ID {feat_edif.id()} ignorada: Sobrepõe um lote existente.")
             continue
 
         # 3. Descobrir a qual Quadra essa edificação pertence
@@ -162,9 +196,8 @@ def extrair_lotes_por_quadra_existente():
             if geom_edif.within(geom_q):
                 quadras_contendo.append(feat_q)
             elif geom_edif.intersects(geom_q):
-                intersecao_q = geom_edif.intersection(geom_q)
-                # Verifica se a invasão é significativa (não apenas um toque mínimo de borda)
-                if intersecao_q.area() > 0.01:
+                # Se invade a quadra vizinha (não apenas encosta na linha divisória)
+                if not geom_edif.touches(geom_q):
                     quadras_intersectadas_parcialmente.append(feat_q)
         
         quadra_valida = None
@@ -176,10 +209,7 @@ def extrair_lotes_por_quadra_existente():
             for lote_adj in lotes_adjacentes:
                 sq_lote = lote_adj.attribute(idx_l_sq)
                 if sq_lote not in (None, NULL):
-                    for id_q, feat_q in quadras_in_bbox.items():
-                        if feat_q.attribute(idx_q_sq) == sq_lote:
-                            quadra_valida = feat_q
-                            break
+                    quadra_valida = mapa_quadras_por_sq.get(sq_lote) 
                 if quadra_valida:
                     break
 
@@ -189,14 +219,23 @@ def extrair_lotes_por_quadra_existente():
         # Trava de segurança para invasão de outras quadras
         invade_quadra_errada = False
         for feat_q_invadida in quadras_intersectadas_parcialmente:
-            # Se a edificação sobrepõe uma quadra diferente daquela que ela vai pertencer
             if feat_q_invadida.id() != quadra_valida.id():
                 invade_quadra_errada = True
                 break
                 
         if invade_quadra_errada:
-            continue # Desiste de processar essa edificação
-        # ----------------------------------------------------------
+            print(f"Edificação ID {feat_edif.id()} ignorada: Invade a quadra vizinha.")
+            continue
+
+        geom_q_valida = quadra_valida.geometry()
+        
+        if not geom_q_valida.within(geom_setor):
+            continue
+        
+        # Se a edificação vazar o limite da quadra principal, bloqueia
+        if not geom_edif.within(geom_q_valida):
+            print(f"Edificação ID {feat_edif.id()} ignorada: Vaza os limites da sua própria Quadra.")
+            continue
 
         q_id = quadra_valida.id()
         if q_id not in edificacoes_por_quadra:
@@ -204,11 +243,10 @@ def extrair_lotes_por_quadra_existente():
         edificacoes_por_quadra[q_id].append(feat_edif)
 
     # =========================================================================
-    # Criação de Lotes, Expansão de Quadras e Mapeamento de Atualizações
+    # Criação de Lotes e Mapeamento de Atualizações
     # =========================================================================
     novas_features_lote = []
-    mapa_quadras_para_atualizar = {}
-
+    
     wkb_lotes = layer_lotes.wkbType()
     is_multi_lote = QgsWkbTypes.isMultiType(wkb_lotes)
 
@@ -224,11 +262,11 @@ def extrair_lotes_por_quadra_existente():
             
         cod_lf_atual = max_lf_dict.get(str_sq, 0) + 1
         
-        geom_quadra_atual = mapa_quadras_para_atualizar.get(q_id, QgsGeometry(quadra.geometry()))
-
-        for feat_edif in lista_edif:
+        for feat_edif in lista_edif: 
             str_lf_atual = str(cod_lf_atual).zfill(4)
-            str_sql_atual = f"{str_sq}{str_lf_atual}"
+            str_sql_atual = f"{str_sq}{str_lf_atual}" 
+            
+            print(f"Sucesso: Processando Edificação ID {feat_edif.id()} -> Gerando Lote e SQL {str_sql_atual}")
             
             atributos_novos = {}
             if idx_e_sql != -1: atributos_novos[idx_e_sql] = str_sql_atual
@@ -236,8 +274,6 @@ def extrair_lotes_por_quadra_existente():
             mapa_edificacoes_para_atualizar[feat_edif.id()] = atributos_novos
 
             geom_lote = QgsGeometry(feat_edif.geometry())
-
-            geom_quadra_atual = geom_quadra_atual.combine(geom_lote)
 
             if is_multi_lote and not geom_lote.isMultipart():
                 geom_lote.convertToMultiType()
@@ -261,13 +297,11 @@ def extrair_lotes_por_quadra_existente():
             novas_features_lote.append(nova_feat_lote)
 
             cod_lf_atual += 1
-            
-        mapa_quadras_para_atualizar[q_id] = geom_quadra_atual
 
     # =========================================================================
     # Inicia a edição nas camadas
     # =========================================================================
-    if novas_features_lote or mapa_edificacoes_para_atualizar or mapa_quadras_para_atualizar:
+    if novas_features_lote or mapa_edificacoes_para_atualizar:
         
         if novas_features_lote:
             layer_lotes.startEditing()
@@ -281,25 +315,13 @@ def extrair_lotes_por_quadra_existente():
                     layer_edif.changeAttributeValue(fid, idx_campo, novo_valor)
             layer_edif.triggerRepaint()
             
-        if mapa_quadras_para_atualizar:
-            layer_quadras.startEditing()
-            for q_id, nova_geom in mapa_quadras_para_atualizar.items():
-                layer_quadras.changeGeometry(q_id, nova_geom)
-            layer_quadras.triggerRepaint()
-
         iface.messageBar().pushMessage(
             "Sucesso",
-            f"Processado: {len(novas_features_lote)} Lotes criados, {len(mapa_edificacoes_para_atualizar)} Edif. atualizadas e {len(mapa_quadras_para_atualizar)} Quadra(s) expandida(s)!",
+            f"Processado: {len(novas_features_lote)} Lote(s) criado(s) e {len(mapa_edificacoes_para_atualizar)} Edificação(ões) atualizada(s)!",
             level=Qgis.Success,
             duration=7
         )
     else:
-        iface.messageBar().pushMessage("Concluído", "Nenhuma edificação atendeu aos critérios estabelecidos.", level=Qgis.Info, duration=5)
+        iface.messageBar().pushMessage("Concluído", "Nenhuma edificação atendeu aos critérios rigorosos para virar lote.", level=Qgis.Info, duration=5)
 
 extrair_lotes_por_quadra_existente()
-
-'''
-Quadras já irregulares: O código funde a geometria do lote à quadra (combine). Se a geometria original da quadra (antes de rodar o script) já estivesse vazando 
-para fora do setor fiscal, ela continuará vazando. O script não corta a quadra para caber no setor; 
-ele apenas garante que o "puxadinho" (novo lote) que está sendo anexado a ela está dentro do setor.
-'''
