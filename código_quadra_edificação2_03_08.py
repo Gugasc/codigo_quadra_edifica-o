@@ -14,7 +14,7 @@ from qgis.utils import iface
 # ==========================================
 # 1. NOMES DAS CAMADAS NO PROJETO DO QGIS
 # ==========================================
-NOME_CAMADA_EDIF = 'edificacao_fiscal_rev1e'
+NOME_CAMADA_EDIF = 'edificacao_fiscal_rev1g'
 NOME_CAMADA_LOTES = 'ct_lote_fiscal'
 NOME_CAMADA_QUADRAS = 'ct_quadra_fiscal'
 NOME_CAMADA_SETORES = 'ct_setor_fiscal'
@@ -49,6 +49,7 @@ def extrair_lotes_todos_os_setores():
     # Abre a edição das camadas uma única vez para todo o processo
     layer_lotes.startEditing()
     layer_edif.startEditing()
+    layer_quadras.startEditing()
 
     wkb_lotes = layer_lotes.wkbType()
     is_multi_lote = QgsWkbTypes.isMultiType(wkb_lotes)
@@ -131,7 +132,9 @@ def extrair_lotes_todos_os_setores():
             engine_edif = QgsGeometry.createGeometryEngine(geom_edif.constGet())
             engine_edif.prepareGeometry()
 
+            # O setor deve conter 100% da edificação. Se vazar para fora, ignora.
             if not engine_setor.contains(geom_edif.constGet()):
+                print(f"Edificação ID {feat_edif.id()} ignorada: Cruza a divisa do setor {cod_sf_atual}.")
                 continue
                 
             bbox_edif = geom_edif.boundingBox()
@@ -189,10 +192,11 @@ def extrair_lotes_todos_os_setores():
                 if engine_edif.within(geom_q):
                     quadras_contendo.append(feat_q)
                 elif engine_edif.intersects(geom_q):
-                    if not engine_edif.touches(geom_q):
-                        quadras_intersectadas_parcialmente.append(feat_q)
+                    quadras_intersectadas_parcialmente.append(feat_q)
             
             quadra_valida = None
+            atribuida_por_proximidade = False
+            
             if len(quadras_contendo) == 1:
                 quadra_valida = quadras_contendo[0]
             elif len(quadras_contendo) == 0 and len(lotes_adjacentes) > 0:
@@ -202,30 +206,108 @@ def extrair_lotes_todos_os_setores():
                         quadra_valida = mapa_quadras_por_sq.get(sq_lote) 
                     if quadra_valida:
                         break
+            
+            # 1. Nova Regra: Se a edificação invadir a rua ou tocar a borda de APENAS UMA quadra
+            if not quadra_valida and len(quadras_intersectadas_parcialmente) == 1:
+                quadra_valida = quadras_intersectadas_parcialmente[0]
+                atribuida_por_proximidade = True
 
-            if not quadra_valida:
-                continue 
-
-            invade_quadra_errada = False
-            for feat_q_invadida in quadras_intersectadas_parcialmente:
-                if feat_q_invadida.id() != quadra_valida.id():
-                    invade_quadra_errada = True
-                    break
+            # 2. Nova Regra: Se ela estiver 100% "isolada" (como na imagem, sem encostar em nada)
+            if not quadra_valida and len(quadras_intersectadas_parcialmente) == 0:
+                menor_distancia = float('inf')
+                quadra_mais_proxima = None
+                
+                for q_id_bbox, feat_q_bbox in quadras_in_bbox.items():
+                    geom_q_bbox = feat_q_bbox.geometry().constGet()
+                    dist = engine_edif.distance(geom_q_bbox)
                     
-            if invade_quadra_errada:
-                continue
+                    if dist < menor_distancia:
+                        menor_distancia = dist
+                        quadra_mais_proxima = feat_q_bbox
+                
+                if quadra_mais_proxima:
+                    quadra_valida = quadra_mais_proxima
+                    atribuida_por_proximidade = True
+
+            # Diagnóstico 1: Se mesmo assim não achou quadra
+            if not quadra_valida:
+                print(f"Edificação ID {feat_edif.id()} ignorada: Nenhuma quadra encontrada por proximidade.")
+                continue 
 
             q_id = quadra_valida.id()
             if q_id not in cache_quadras_validas:
                 geom_q_valida_teste = quadra_valida.geometry()
-                cache_quadras_validas[q_id] = engine_setor.contains(geom_q_valida_teste.constGet())
+                # CORREÇÃO CRÍTICA: 'intersects' em vez de 'contains' para evitar erros de borda
+                cache_quadras_validas[q_id] = engine_setor.intersects(geom_q_valida_teste.constGet())
                 
+            # Diagnóstico 2: Quadra inválida
             if not cache_quadras_validas[q_id]:
+                print(f"Edificação ID {feat_edif.id()} ignorada: A quadra {q_id} não pertence/intersecta o setor.")
                 continue
             
             geom_q_valida_const = quadra_valida.geometry().constGet()
-            if not engine_edif.within(geom_q_valida_const):
+
+            # =================================================================
+            # NOVA LÓGICA: Expandir a Quadra para cobrir a Edificação
+            # =================================================================
+            geom_q_atual = quadra_valida.geometry()
+            geom_edif_atual = feat_edif.geometry()
+            
+            # 1. Faz a união temporária na memória
+            nova_geom_quadra = geom_q_atual.combine(geom_edif_atual)
+            
+            # (CORREÇÃO POSTGIS: Forçar Polígono Simples)
+            wkb_quadra = layer_quadras.wkbType()
+            is_multi_quadra = QgsWkbTypes.isMultiType(wkb_quadra)
+            
+            if not is_multi_quadra and nova_geom_quadra.isMultipart():
+                maior_area_q = -1
+                geom_simples_q = nova_geom_quadra
+                for part in nova_geom_quadra.asGeometryCollection():
+                    if part.area() > maior_area_q:
+                        maior_area_q = part.area()
+                        geom_simples_q = part
+                nova_geom_quadra = geom_simples_q
+
+            # 2. TRAVA DE SEGURANÇA MÁXIMA: Consulta a camada inteira
+            geom_q_teste = QgsGeometry(nova_geom_quadra)
+            chocou_com_outra_quadra = False
+            
+            # Puxa direto da camada do projeto qualquer quadra que cruze essa nova área
+            req_colisao = QgsFeatureRequest().setFilterRect(geom_q_teste.boundingBox())
+            
+            for feat_outra_q in layer_quadras.getFeatures(req_colisao):
+                if feat_outra_q.id() == q_id: 
+                    continue # Ignora a si mesma
+                
+                geom_outra = QgsGeometry(feat_outra_q.geometry())
+                
+                # Verifica se há interseção real
+                if geom_q_teste.intersects(geom_outra):
+                    intersecao = geom_q_teste.intersection(geom_outra)
+                    
+                    # IMPORTANTE: Tolerância de Área
+                    # Se seu projeto estiver em METROS (ex: SIRGAS 2000 / UTM), 0.0001 é 1 cm².
+                    # Se estiver em GRAUS (Lat/Long), mude para 0.000000001
+                    if intersecao.area() > 0.0001:
+                        chocou_com_outra_quadra = True
+                        break
+            
+            if chocou_com_outra_quadra:
+                print(f"Edificação ID {feat_edif.id()} ignorada: Invasão detectada com a quadra vizinha ID {feat_outra_q.id()}.")
                 continue
+            
+            # 3. ATUALIZAÇÃO E SINCRONIA DO ÍNDICE (O Segredo para evitar o erro)
+            # Retira a geometria antiga da quadra do radar
+            index_quadras.deleteFeature(quadra_valida)
+            
+            # Efetiva as alterações no QGIS e na variável
+            layer_quadras.changeGeometry(q_id, nova_geom_quadra)
+            quadra_valida.setGeometry(nova_geom_quadra)
+            
+            # Adiciona a quadra de volta ao radar, agora com o tamanho novo
+            index_quadras.addFeature(quadra_valida)
+            # =================================================================
 
             if q_id not in edificacoes_por_quadra:
                 edificacoes_por_quadra[q_id] = []
