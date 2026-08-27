@@ -253,8 +253,18 @@ def extrair_lotes_todos_os_setores():
             geom_q_atual = quadra_valida.geometry()
             geom_edif_atual = feat_edif.geometry()
             
-            # 1. Faz a união temporária na memória
-            nova_geom_quadra = geom_q_atual.combine(geom_edif_atual)
+            # Calcula o vão vazio entre a quadra e a edificação
+            distancia_vao = geom_q_atual.distance(geom_edif_atual)
+            
+            if distancia_vao > 0:
+                # Aplica um buffer ligeiramente maior que o vão (+ 0.1) para garantir sobreposição.
+                # ATENÇÃO: O valor 0.1 assume que seu projeto está em METROS (SIRGAS 2000 / UTM).
+                geom_para_unir = geom_edif_atual.buffer(distancia_vao + 0.001, 5)
+            else:
+                geom_para_unir = geom_edif_atual
+            
+            # 1. Faz a união temporária na memória (agora elas se tocam e formam polígono único)
+            nova_geom_quadra = geom_q_atual.combine(geom_para_unir)
             
             # (CORREÇÃO POSTGIS: Forçar Polígono Simples)
             wkb_quadra = layer_quadras.wkbType()
@@ -282,16 +292,9 @@ def extrair_lotes_todos_os_setores():
                 
                 geom_outra = QgsGeometry(feat_outra_q.geometry())
                 
-                # Verifica se há interseção real
-                if geom_q_teste.intersects(geom_outra):
-                    intersecao = geom_q_teste.intersection(geom_outra)
-                    
-                    # IMPORTANTE: Tolerância de Área
-                    # Se seu projeto estiver em METROS (ex: SIRGAS 2000 / UTM), 0.0001 é 1 cm².
-                    # Se estiver em GRAUS (Lat/Long), mude para 0.000000001
-                    if intersecao.area() > 0.0001:
-                        chocou_com_outra_quadra = True
-                        break
+                if geom_q_teste.intersects(geom_outra) and not geom_q_teste.touches(geom_outra):
+                    chocou_com_outra_quadra = True
+                    break
             
             if chocou_com_outra_quadra:
                 print(f"Edificação ID {feat_edif.id()} ignorada: Invasão detectada com a quadra vizinha ID {feat_outra_q.id()}.")
@@ -317,7 +320,7 @@ def extrair_lotes_todos_os_setores():
         novas_features_lote = []
         for q_id, lista_edif in edificacoes_por_quadra.items():
             quadra = quadras_in_bbox[q_id]
-            str_sq = str(quadra.attribute(idx_q_sq)) if quadra.attribute(idx_q_sq) not in (None, NULL) else ""
+            str_sq = str(quadra.attribute(idx_q_sq)).strip() if quadra.attribute(idx_q_sq) not in (None, NULL) else ""
             cod_qf = quadra.attribute(idx_q_qf)
             valor_sf_sat = quadra.attribute(idx_q_sat)
             
@@ -364,8 +367,16 @@ def extrair_lotes_todos_os_setores():
 
         if mapa_edificacoes_para_atualizar:
             for fid, atributos in mapa_edificacoes_para_atualizar.items():
-                for idx_campo, novo_valor in atributos.items():
-                    layer_edif.changeAttributeValue(fid, idx_campo, novo_valor)
+                feat_update = layer_edif.getFeature(fid)
+                if feat_update.isValid():
+                    for idx_campo, novo_valor in atributos.items():
+                        feat_update.setAttribute(idx_campo, novo_valor)
+                    
+                    sucesso = layer_edif.updateFeature(feat_update)
+                    if not sucesso:
+                        valores_debug = [f"Valor: '{v}' (Tamanho: {len(str(v))})" for v in atributos.values()]
+                        print(f"ERRO: O QGIS bloqueou a atualização da Edificação {fid}. {valores_debug}")
+                        
             total_edif_atualizadas += len(mapa_edificacoes_para_atualizar)
 
     # Atualiza a tela ao finalizar todos os setores
