@@ -7,7 +7,8 @@ from qgis.core import (
     Qgis,
     QgsWkbTypes,
     NULL,
-    QgsGeometryEngine
+    QgsGeometryEngine,
+    QgsProviderRegistry
 )
 from qgis.utils import iface
 
@@ -36,11 +37,21 @@ NOME_CAMPO_RELACAO_SAT = 'cod_sf_sat'
 # fique ligeiramente maior que o lote. Use 0.0 para a quadra ter a
 # mesma geometria da edificação. O valor está na unidade do projeto
 # (normalmente metros em uma camada UTM).
-MARGEM_NOVA_QUADRA = 0.00001
+MARGEM_NOVA_QUADRA = 0.001
 
 # O SQ é formado por cod_sf_sat (3 dígitos) + cod_qf (4 dígitos).
 # Exemplo: cod_sf_sat=201 e cod_qf=134 => sq=2010134.
 CRIAR_QUADRA_PARA_EDIFICACAO_ISOLADA = True
+
+# Mantenha False para que o Console Python mostre somente conflitos que a
+# trigger de sobreposição poderia rejeitar. Altere para True apenas quando
+# for necessário investigar as demais regras do processamento.
+EXIBIR_DIAGNOSTICOS_COMPLETOS = False
+
+def diagnostico(*mensagens):
+    """Imprime mensagens operacionais somente no modo detalhado."""
+    if EXIBIR_DIAGNOSTICOS_COMPLETOS:
+        print(*mensagens)
 
 def obter_camada_do_projeto(nome_camada):
     camadas = QgsProject.instance().mapLayersByName(nome_camada)
@@ -180,19 +191,178 @@ def ajustar_geometria_para_camada(geometria, eh_multi):
 
     return geometria
 
-def encontrar_colisao_com_quadra(layer_quadras, geometria_teste, id_ignorar=None):
-    """Retorna o ID de uma quadra invadida ou None quando não há colisão."""
-    requisicao = QgsFeatureRequest().setFilterRect(geometria_teste.boundingBox())
+def encontrar_colisao_com_quadra(geometrias_finais, geometria_teste, sq_teste):
+    """Impede contatos de interior entre quadras com SQs diferentes.
 
-    for outra_quadra in layer_quadras.getFeatures(requisicao):
-        if id_ignorar is not None and outra_quadra.id() == id_ignorar:
+    A trigger usa ST_Overlaps. A validação local é deliberadamente mais
+    conservadora porque o PostGIS encontrou sobreposições que o método
+    QgsGeometry.overlaps não reportou. Toda sobreposição também é uma
+    interseção que não apenas toca a borda.
+    """
+    bbox_teste = geometria_teste.boundingBox()
+
+    for id_outra, dados_outra in geometrias_finais.items():
+        geometria_outra = dados_outra['geom']
+        sq_outra = dados_outra['sq']
+
+        # No PostgreSQL, NULL <> valor (e NULL <> NULL) não resulta em TRUE.
+        # Portanto, nesses casos a linha também não entra no IF EXISTS.
+        if sq_teste in (None, NULL) or sq_outra in (None, NULL):
             continue
 
-        geometria_outra = QgsGeometry(outra_quadra.geometry())
+        # A trigger não exclui pelo ID: ela exclui pelo SQ.
+        if sq_outra == sq_teste:
+            continue
+
+        if not bbox_teste.intersects(geometria_outra.boundingBox()):
+            continue
+
+        # Geometrias que somente tocam suas bordas continuam permitidas.
+        # O teste é mais restritivo que ST_Overlaps e, portanto, também
+        # bloqueia contenção ou igualdade entre SQs diferentes.
         if geometria_teste.intersects(geometria_outra) and not geometria_teste.touches(geometria_outra):
-            return outra_quadra.id()
+            return id_outra
 
     return None
+
+def criar_contexto_postgis(layer_quadras):
+    """Cria uma conexão somente de consulta usando a URI da própria camada."""
+    if layer_quadras.providerType() != 'postgres':
+        return None, 'A camada de quadras não usa o provedor PostgreSQL.'
+
+    try:
+        provedor = layer_quadras.dataProvider()
+        uri = provedor.uri()
+        metadados = QgsProviderRegistry.instance().providerMetadata('postgres')
+        conexao = metadados.createConnection(uri.uri(), {})
+        conexao.executeSql('SELECT 1')
+
+        esquema = uri.schema()
+        tabela = uri.table()
+        coluna_geom = uri.geometryColumn() or 'geom'
+        srid = layer_quadras.crs().postgisSrid()
+
+        if not tabela or srid <= 0:
+            return None, 'Não foi possível identificar a tabela ou o SRID das quadras.'
+
+        return {
+            'conexao': conexao,
+            'esquema': esquema,
+            'tabela': tabela,
+            'coluna_geom': coluna_geom,
+            'srid': srid
+        }, None
+    except Exception as erro:
+        return None, str(erro)
+
+def citar_identificador_postgres(nome):
+    """Protege nomes de esquema, tabela e coluna usados no SELECT."""
+    return '"' + str(nome).replace('"', '""') + '"'
+
+def encontrar_colisao_no_postgis(contexto, geometria_teste, sq_teste):
+    """Executa no servidor a mesma condição ST_Overlaps da trigger."""
+    if sq_teste in (None, NULL):
+        return None, None
+
+    try:
+        hex_wkb = bytes(geometria_teste.asWkb()).hex()
+        sq_sql = str(sq_teste).replace("'", "''")
+        esquema = contexto['esquema']
+        tabela = citar_identificador_postgres(contexto['tabela'])
+        if esquema:
+            tabela = f'{citar_identificador_postgres(esquema)}.{tabela}'
+
+        geom = citar_identificador_postgres(contexto['coluna_geom'])
+        srid = int(contexto['srid'])
+        sql = f"""
+            WITH candidata AS (
+                SELECT ST_SetSRID(
+                    ST_GeomFromWKB(decode('{hex_wkb}', 'hex')),
+                    {srid}
+                ) AS geom
+            )
+            SELECT b."id"::text, b."sq"::text
+            FROM {tabela} AS b
+            CROSS JOIN candidata AS c
+            WHERE b."sq" <> '{sq_sql}'
+              AND b.{geom} && c.geom
+              AND ST_Overlaps(b.{geom}, c.geom)
+            LIMIT 1
+        """
+        linhas = contexto['conexao'].executeSql(sql)
+        if linhas:
+            return {
+                'id': linhas[0][0],
+                'sq': linhas[0][1]
+            }, None
+        return None, None
+    except Exception as erro:
+        return None, str(erro)
+
+def encontrar_colisao_pendente_no_postgis(
+    contexto,
+    geometrias_pendentes,
+    geometria_teste,
+    sq_teste
+):
+    """Compara a candidata com as geometrias ainda não salvas no PostGIS."""
+    if sq_teste in (None, NULL) or not geometrias_pendentes:
+        return None, None
+
+    try:
+        bbox_teste = geometria_teste.boundingBox()
+        valores = []
+        srid = int(contexto['srid'])
+
+        for id_pendente, dados_pendentes in geometrias_pendentes.items():
+            sq_pendente = dados_pendentes['sq']
+            geom_pendente = dados_pendentes['geom']
+
+            if sq_pendente in (None, NULL) or sq_pendente == sq_teste:
+                continue
+            if not bbox_teste.intersects(geom_pendente.boundingBox()):
+                continue
+
+            id_sql = str(id_pendente).replace("'", "''")
+            sq_sql = str(sq_pendente).replace("'", "''")
+            hex_wkb = bytes(geom_pendente.asWkb()).hex()
+            valores.append(
+                f"('{id_sql}', '{sq_sql}', "
+                f"ST_SetSRID(ST_GeomFromWKB(decode('{hex_wkb}', 'hex')), {srid}))"
+            )
+
+        if not valores:
+            return None, None
+
+        hex_candidata = bytes(geometria_teste.asWkb()).hex()
+        sq_candidata = str(sq_teste).replace("'", "''")
+        sql = f"""
+            WITH candidata AS (
+                SELECT ST_SetSRID(
+                    ST_GeomFromWKB(decode('{hex_candidata}', 'hex')),
+                    {srid}
+                ) AS geom
+            ),
+            pendentes(id, sq, geom) AS (
+                VALUES {', '.join(valores)}
+            )
+            SELECT p.id, p.sq
+            FROM pendentes AS p
+            CROSS JOIN candidata AS c
+            WHERE p.sq <> '{sq_candidata}'
+              AND p.geom && c.geom
+              AND ST_Overlaps(p.geom, c.geom)
+            LIMIT 1
+        """
+        linhas = contexto['conexao'].executeSql(sql)
+        if linhas:
+            return {
+                'id': linhas[0][0],
+                'sq': linhas[0][1]
+            }, None
+        return None, None
+    except Exception as erro:
+        return None, str(erro)
 
 def extrair_lotes_todos_os_setores():
     iface.messageBar().pushMessage("Aguarde", "Verificando camadas no projeto...", level=Qgis.Info, duration=2)
@@ -286,15 +456,70 @@ def extrair_lotes_todos_os_setores():
     idx_l_sq, idx_l_sql, idx_l_lf = [layer_lotes.fields().indexOf(f) for f in ['sq', 'sql', 'cod_lf']]
     idx_e_sql = layer_edif.fields().indexOf('sql')
 
+    contexto_postgis, erro_postgis = criar_contexto_postgis(layer_quadras)
+    if erro_postgis is not None:
+        iface.messageBar().pushMessage(
+            'Erro',
+            'Não foi possível preparar a validação de sobreposição no PostGIS. '
+            'Nenhuma alteração foi realizada.',
+            level=Qgis.Critical,
+            duration=15
+        )
+        print(f'[ERRO VALIDAÇÃO POSTGIS] {erro_postgis}')
+        return
+
     # Abre a edição das camadas uma única vez para todo o processo
     layer_lotes.startEditing()
     layer_edif.startEditing()
     layer_quadras.startEditing()
 
+    # Mantém a geometria final prevista de todas as quadras. Isso evita
+    # colisões entre alterações ainda pendentes de salvamento no QGIS.
+    geometrias_finais_quadras = {
+        feat.id(): {
+            'geom': QgsGeometry(feat.geometry()),
+            'sq': feat.attribute(idx_q_sq)
+        }
+        for feat in layer_quadras.getFeatures()
+    }
+
+    # Não acumula uma nova execução sobre quadras, lotes ou edificações
+    # que já estavam pendentes no QGIS.
+    pendencias_por_camada = {}
+    for camada in (layer_quadras, layer_lotes, layer_edif):
+        ids_pendentes = set()
+        buffer_camada = camada.editBuffer()
+        if buffer_camada is not None:
+            ids_pendentes.update(buffer_camada.changedGeometries().keys())
+            ids_pendentes.update(buffer_camada.changedAttributeValues().keys())
+            ids_pendentes.update(buffer_camada.addedFeatures().keys())
+            ids_pendentes.update(buffer_camada.deletedFeatureIds())
+        if ids_pendentes:
+            pendencias_por_camada[camada.name()] = len(ids_pendentes)
+
+    if pendencias_por_camada:
+        resumo_pendencias = ', '.join(
+            f'{nome}: {quantidade}'
+            for nome, quantidade in pendencias_por_camada.items()
+        )
+        iface.messageBar().pushMessage(
+            'Erro',
+            'Já existem alterações pendentes. Reverta as camadas indicadas '
+            'no Console Python antes de executar novamente.',
+            level=Qgis.Critical,
+            duration=15
+        )
+        print(f'[BUFFER PENDENTE] {resumo_pendencias}')
+        return
+
     wkb_quadra = layer_quadras.wkbType()
     is_multi_quadra = QgsWkbTypes.isMultiType(wkb_quadra)
 
     total_quadras_criadas = 0
+    # Guarda somente as quadras que este script efetivamente alterou. O
+    # resumo final permite confrontá-las com o erro devolvido pelo PostGIS.
+    quadras_alteradas = {}
+    geometrias_pendentes_postgis = {}
 
     # Loop para percorrer CADA SETOR encontrado
     for idx_setor, setor_selecionado in enumerate(setores):
@@ -309,10 +534,10 @@ def extrair_lotes_todos_os_setores():
             indice_setor_sat,
             mapa_sf_para_sat
         )
-        print(f"Processando Setor ({idx_setor + 1}/{len(setores)}) - Código: {cod_sf_atual}")
+        diagnostico(f"Processando Setor ({idx_setor + 1}/{len(setores)}) - Código: {cod_sf_atual}")
 
         if cod_sf_sat_setor is None:
-            print(
+            diagnostico(
                 f'Setor {cod_sf_atual} sem relação válida com cod_sf_sat. '
                 'Edificações isoladas deste setor não gerarão nova quadra.'
             )
@@ -390,7 +615,7 @@ def extrair_lotes_todos_os_setores():
 
             # O setor deve conter 100% da edificação. Se vazar para fora, ignora.
             if not engine_setor.contains(geom_edif.constGet()):
-                print(f"Edificação ID {feat_edif.id()} ignorada: Cruza a divisa do setor {cod_sf_atual}.")
+                diagnostico(f"Edificação ID {feat_edif.id()} ignorada: Cruza a divisa do setor {cod_sf_atual}.")
                 continue
                 
             bbox_edif = geom_edif.boundingBox()
@@ -488,14 +713,14 @@ def extrair_lotes_todos_os_setores():
                 cod_sf_sat_novo = cod_sf_sat_setor
 
                 if cod_sf_novo is None or not 1 <= cod_sf_novo <= 114:
-                    print(
+                    diagnostico(
                         f'Edificação ID {feat_edif.id()} ignorada: '
                         f'cod_sf inválido para o setor {cod_sf_atual}.'
                     )
                     continue
 
                 if cod_sf_sat_novo is None or not 88 <= cod_sf_sat_novo <= 201:
-                    print(
+                    diagnostico(
                         f'Edificação ID {feat_edif.id()} ignorada: '
                         f'cod_sf_sat inválido para o setor {cod_sf_atual}.'
                     )
@@ -509,7 +734,7 @@ def extrair_lotes_todos_os_setores():
                 )
 
                 if cod_qf_novo is None:
-                    print(
+                    diagnostico(
                         f'Edificação ID {feat_edif.id()} ignorada: '
                         f'não foi possível gerar cod_qf para cod_sf {cod_sf_novo}.'
                     )
@@ -517,7 +742,7 @@ def extrair_lotes_todos_os_setores():
 
                 str_sq_nova = montar_sq(cod_sf_sat_novo, cod_qf_novo)
                 if str_sq_nova is None or len(str_sq_nova) != 7:
-                    print(
+                    diagnostico(
                         f'Edificação ID {feat_edif.id()} ignorada: '
                         f'SQ inválido gerado ({str_sq_nova}).'
                     )
@@ -527,21 +752,75 @@ def extrair_lotes_todos_os_setores():
                 geometria_nova_quadra = ajustar_geometria_para_camada(geometria_nova_quadra, is_multi_quadra)
 
                 if geometria_nova_quadra.isEmpty() or not geometria_nova_quadra.isGeosValid():
-                    print(f'Edificação ID {feat_edif.id()} ignorada: Não foi possível gerar a nova quadra.')
+                    diagnostico(f'Edificação ID {feat_edif.id()} ignorada: Não foi possível gerar a nova quadra.')
                     continue
 
                 if not engine_setor.contains(geometria_nova_quadra.constGet()):
-                    print(
+                    diagnostico(
                         f'Edificação {feat_edif.id()} ignorada: '
                         'a nova quadra ultrapassaria o setor.'
                     )
                     continue
 
-                id_quadras_colidida = encontrar_colisao_com_quadra(layer_quadras, geometria_nova_quadra)
+                id_quadras_colidida = encontrar_colisao_com_quadra(
+                    geometrias_finais_quadras,
+                    geometria_nova_quadra,
+                    str_sq_nova
+                )
                 if id_quadras_colidida is not None:
+                    sq_colidida = geometrias_finais_quadras[id_quadras_colidida]['sq']
                     print(
-                        f'Edificação ID {feat_edif.id()} ignorada: '
-                        f'a nova quadra colidiria com a quadra ID {id_quadras_colidida}.'
+                        f'[SOBREPOSIÇÃO LOCAL] Edificação ID {feat_edif.id()}: '
+                        f'a nova quadra SQ {str_sq_nova} sobreporia a quadra '
+                        f'SQ {sq_colidida} (ID {id_quadras_colidida}).'
+                    )
+                    continue
+
+                conflito_postgis, erro_postgis = encontrar_colisao_no_postgis(
+                    contexto_postgis,
+                    geometria_nova_quadra,
+                    str_sq_nova
+                )
+                if erro_postgis is not None:
+                    print(f'[ERRO VALIDAÇÃO POSTGIS] {erro_postgis}')
+                    iface.messageBar().pushMessage(
+                        'Erro',
+                        'A consulta de sobreposição ao PostGIS falhou. '
+                        'Descarte as alterações desta execução.',
+                        level=Qgis.Critical,
+                        duration=15
+                    )
+                    return
+                if conflito_postgis is not None:
+                    print(
+                        f'[SOBREPOSIÇÃO POSTGIS] Edificação ID {feat_edif.id()}: '
+                        f'a nova quadra SQ {str_sq_nova} sobreporia a quadra '
+                        f'SQ {conflito_postgis["sq"]} (ID {conflito_postgis["id"]}).'
+                    )
+                    continue
+
+                conflito_pendente, erro_postgis = encontrar_colisao_pendente_no_postgis(
+                    contexto_postgis,
+                    geometrias_pendentes_postgis,
+                    geometria_nova_quadra,
+                    str_sq_nova
+                )
+                if erro_postgis is not None:
+                    print(f'[ERRO VALIDAÇÃO POSTGIS] {erro_postgis}')
+                    iface.messageBar().pushMessage(
+                        'Erro',
+                        'A comparação das quadras pendentes no PostGIS falhou. '
+                        'Descarte as alterações desta execução.',
+                        level=Qgis.Critical,
+                        duration=15
+                    )
+                    return
+                if conflito_pendente is not None:
+                    print(
+                        f'[SOBREPOSIÇÃO PENDENTE POSTGIS] Edificação ID '
+                        f'{feat_edif.id()}: a nova quadra SQ {str_sq_nova} '
+                        f'sobreporia a quadra pendente SQ '
+                        f'{conflito_pendente["sq"]} (ID {conflito_pendente["id"]}).'
                     )
                     continue
 
@@ -557,14 +836,23 @@ def extrair_lotes_todos_os_setores():
                 if idx_q_qf != -1:
                     nova_feat_quadra[idx_q_qf] = cod_qf_novo
                 if not layer_quadras.addFeature(nova_feat_quadra):
-                    print(f'Edificação ID {feat_edif.id()} ignorada: Falha ao inserir a nova quadra.')
+                    diagnostico(f'Edificação ID {feat_edif.id()} ignorada: Falha ao inserir a nova quadra.')
                     continue
 
                 q_id_novo = nova_feat_quadra.id()
+                geometrias_finais_quadras[q_id_novo] = {
+                    'geom': QgsGeometry(geometria_nova_quadra),
+                    'sq': str_sq_nova
+                }
                 quadras_in_bbox[q_id_novo] = nova_feat_quadra
                 quadra_valida = nova_feat_quadra
                 quadra_nova = True
                 total_quadras_criadas += 1
+                quadras_alteradas[q_id_novo] = str_sq_nova
+                geometrias_pendentes_postgis[q_id_novo] = {
+                    'geom': QgsGeometry(geometria_nova_quadra),
+                    'sq': str_sq_nova
+                }
 
                 # Não adiciona a nova quadra ao índice de classificação neste
                 # setor. Assim, duas edificações isoladas geram duas quadras,
@@ -574,12 +862,12 @@ def extrair_lotes_todos_os_setores():
             # Se há mais de uma quadra contendo a edificação ou mais de uma
             # quadra tocada, a situação é ambígua e não deve gerar uma quadra.
             if not quadra_valida and not edificacao_isolada:
-                print(f'Edificação ID {feat_edif.id()} ignorada: Relação ambígua com as quadras existentes.')
+                diagnostico(f'Edificação ID {feat_edif.id()} ignorada: Relação ambígua com as quadras existentes.')
                 continue
 
             # Diagnóstico 1: Se mesmo assim não achou quadra
             if not quadra_valida:
-                print(f"Edificação ID {feat_edif.id()} ignorada: Nenhuma quadra encontrada.")
+                diagnostico(f"Edificação ID {feat_edif.id()} ignorada: Nenhuma quadra encontrada.")
                 continue 
 
             q_id = quadra_valida.id()
@@ -590,7 +878,7 @@ def extrair_lotes_todos_os_setores():
                 
             # Diagnóstico 2: Quadra inválida
             if not cache_quadras_validas[q_id]:
-                print(f"Edificação ID {feat_edif.id()} ignorada: A quadra {q_id} não pertence/intersecta o setor.")
+                diagnostico(f"Edificação ID {feat_edif.id()} ignorada: A quadra {q_id} não pertence/intersecta o setor.")
                 continue
             
             # Quadras existentes continuam sendo ampliadas para alcançar a
@@ -599,6 +887,18 @@ def extrair_lotes_todos_os_setores():
             if not quadra_nova:
                 geom_q_atual = quadra_valida.geometry()
                 geom_edif_atual = feat_edif.geometry()
+
+                # Não envie um UPDATE de geometria quando a quadra já contém
+                # integralmente a edificação. Mesmo que combine() produza uma
+                # geometria topologicamente igual, changeGeometry() marcaria a
+                # feição como alterada e faria a trigger revalidar uma quadra
+                # cuja forma não precisava ser modificada.
+                if engine_edif.within(geom_q_atual.constGet()):
+                    if q_id not in edificacoes_por_quadra:
+                        edificacoes_por_quadra[q_id] = []
+                    edificacoes_por_quadra[q_id].append(feat_edif)
+                    continue
+
                 distancia_vao = geom_q_atual.distance(geom_edif_atual)
 
                 if distancia_vao > 0:
@@ -609,23 +909,100 @@ def extrair_lotes_todos_os_setores():
                 nova_geom_quadra = geom_q_atual.combine(geom_para_unir)
                 nova_geom_quadra = ajustar_geometria_para_camada(nova_geom_quadra, is_multi_quadra)
 
+                if nova_geom_quadra.isEmpty() or not nova_geom_quadra.isGeosValid():
+                    diagnostico(f'Edificação ID {feat_edif.id()} ignorada: expansão gerou geometria inválida.')
+                    continue
+
+                # Segunda proteção contra UPDATEs sem alteração espacial
+                # efetiva (por exemplo, diferenças numéricas nas bordas).
+                if nova_geom_quadra.equals(geom_q_atual):
+                    if q_id not in edificacoes_por_quadra:
+                        edificacoes_por_quadra[q_id] = []
+                    edificacoes_por_quadra[q_id].append(feat_edif)
+                    continue
+
                 id_quadras_colidida = encontrar_colisao_com_quadra(
-                    layer_quadras,
+                    geometrias_finais_quadras,
                     nova_geom_quadra,
-                    id_ignorar=q_id
+                    quadra_valida.attribute(idx_q_sq)
                 )
 
                 if id_quadras_colidida is not None:
+                    sq_colidida = geometrias_finais_quadras[id_quadras_colidida]['sq']
                     print(
-                        f'Edificação ID {feat_edif.id()} ignorada: '
-                        f'invasão detectada com a quadra vizinha ID {id_quadras_colidida}.'
+                        f'[SOBREPOSIÇÃO LOCAL] Edificação ID {feat_edif.id()}: '
+                        f'a alteração da quadra SQ '
+                        f'{quadra_valida.attribute(idx_q_sq)} seria recusada pela trigger: '
+                        f'sobreposição com SQ {sq_colidida} (ID {id_quadras_colidida}).'
                     )
                     continue
 
+                sq_quadra_atual = quadra_valida.attribute(idx_q_sq)
+                conflito_postgis, erro_postgis = encontrar_colisao_no_postgis(
+                    contexto_postgis,
+                    nova_geom_quadra,
+                    sq_quadra_atual
+                )
+                if erro_postgis is not None:
+                    print(f'[ERRO VALIDAÇÃO POSTGIS] {erro_postgis}')
+                    iface.messageBar().pushMessage(
+                        'Erro',
+                        'A consulta de sobreposição ao PostGIS falhou. '
+                        'Descarte as alterações desta execução.',
+                        level=Qgis.Critical,
+                        duration=15
+                    )
+                    return
+                if conflito_postgis is not None:
+                    print(
+                        f'[SOBREPOSIÇÃO POSTGIS] Edificação ID {feat_edif.id()}: '
+                        f'a alteração da quadra SQ {sq_quadra_atual} seria '
+                        f'recusada pela trigger: sobreposição com SQ '
+                        f'{conflito_postgis["sq"]} (ID {conflito_postgis["id"]}).'
+                    )
+                    continue
+
+                conflito_pendente, erro_postgis = encontrar_colisao_pendente_no_postgis(
+                    contexto_postgis,
+                    geometrias_pendentes_postgis,
+                    nova_geom_quadra,
+                    sq_quadra_atual
+                )
+                if erro_postgis is not None:
+                    print(f'[ERRO VALIDAÇÃO POSTGIS] {erro_postgis}')
+                    iface.messageBar().pushMessage(
+                        'Erro',
+                        'A comparação das quadras pendentes no PostGIS falhou. '
+                        'Descarte as alterações desta execução.',
+                        level=Qgis.Critical,
+                        duration=15
+                    )
+                    return
+                if conflito_pendente is not None:
+                    print(
+                        f'[SOBREPOSIÇÃO PENDENTE POSTGIS] Edificação ID '
+                        f'{feat_edif.id()}: a alteração da quadra SQ '
+                        f'{sq_quadra_atual} sobreporia a quadra pendente SQ '
+                        f'{conflito_pendente["sq"]} (ID {conflito_pendente["id"]}).'
+                    )
+                    continue
+
+                if not layer_quadras.changeGeometry(q_id, nova_geom_quadra):
+                    diagnostico(f'Edificação ID {feat_edif.id()} ignorada: falha ao alterar a geometria da quadra {q_id}.')
+                    continue
+
                 index_quadras.deleteFeature(quadra_valida)
-                layer_quadras.changeGeometry(q_id, nova_geom_quadra)
                 quadra_valida.setGeometry(nova_geom_quadra)
                 index_quadras.addFeature(quadra_valida)
+                geometrias_finais_quadras[q_id] = {
+                    'geom': QgsGeometry(nova_geom_quadra),
+                    'sq': quadra_valida.attribute(idx_q_sq)
+                }
+                quadras_alteradas[q_id] = quadra_valida.attribute(idx_q_sq)
+                geometrias_pendentes_postgis[q_id] = {
+                    'geom': QgsGeometry(nova_geom_quadra),
+                    'sq': quadra_valida.attribute(idx_q_sq)
+                }
 
             if q_id not in edificacoes_por_quadra:
                 edificacoes_por_quadra[q_id] = []
@@ -637,21 +1014,21 @@ def extrair_lotes_todos_os_setores():
             quadra = quadras_in_bbox[q_id]
             str_sq = str(quadra.attribute(idx_q_sq)).strip() if quadra.attribute(idx_q_sq) not in (None, NULL) else ""
             if len(str_sq) != 7:
-                print(f'Quadra ID {q_id}: SQ inválido ({str_sq}).')
+                diagnostico(f'Quadra ID {q_id}: SQ inválido ({str_sq}).')
                 continue
                 
             cod_lf_atual = max_lf_dict.get(str_sq, 0) + 1
             
             for feat_edif in lista_edif: 
                 if cod_lf_atual > 9999:
-                    print(f'Quadra {str_sq}: limite de lotes atingido.')
+                    diagnostico(f'Quadra {str_sq}: limite de lotes atingido.')
                     break
 
                 str_lf_atual = str(cod_lf_atual).zfill(4)
                 str_sql_atual = f"{str_sq}{str_lf_atual}" 
 
                 if len(str_sql_atual) != 11:
-                    print(f'SQL inválido: {str_sql_atual}')
+                    diagnostico(f'SQL inválido: {str_sql_atual}')
                     cod_lf_atual += 1
                     continue
                 
@@ -696,7 +1073,7 @@ def extrair_lotes_todos_os_setores():
                     sucesso = layer_edif.updateFeature(feat_update)
                     if not sucesso:
                         valores_debug = [f"Valor: '{v}' (Tamanho: {len(str(v))})" for v in atributos.values()]
-                        print(f"ERRO: O QGIS bloqueou a atualização da Edificação {fid}. {valores_debug}")
+                        diagnostico(f"ERRO: O QGIS bloqueou a atualização da Edificação {fid}. {valores_debug}")
                         
             total_edif_atualizadas += len(mapa_edificacoes_para_atualizar)
 
@@ -704,6 +1081,19 @@ def extrair_lotes_todos_os_setores():
     layer_lotes.triggerRepaint()
     layer_edif.triggerRepaint()
     layer_quadras.triggerRepaint()
+
+    if quadras_alteradas:
+        lista_quadras_alteradas = ', '.join(
+            f'ID {q_id} / SQ {sq}'
+            for q_id, sq in sorted(quadras_alteradas.items())
+        )
+        filtro_quadras = layer_quadras.subsetString() or '(nenhum)'
+        print(
+            '[RESUMO POSTGIS] '
+            f'Filtro da camada: {filtro_quadras}. '
+            f'Quadras alteradas ({len(quadras_alteradas)}): '
+            f'{lista_quadras_alteradas}'
+        )
 
     if total_lotes_criados > 0 or total_edif_atualizadas > 0 or total_quadras_criadas > 0:
         iface.messageBar().pushMessage(
