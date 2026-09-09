@@ -11,6 +11,7 @@ from qgis.core import (
     QgsProviderRegistry
 )
 from qgis.utils import iface
+from qgis.PyQt.QtWidgets import QInputDialog
 
 # ==========================================
 # 1. NOMES DAS CAMADAS NO PROJETO DO QGIS
@@ -21,14 +22,6 @@ NOME_CAMADA_QUADRAS = 'ct_quadra_fiscal'
 NOME_CAMADA_SETORES = 'ct_setor_fiscal'
 
 NOME_CAMPO_SETOR = 'cod_sf'
-NOME_CAMPO_SETOR_SAT = 'cod_sf_sat'
-
-# Se cod_sf_sat não estiver na camada de setores, informe aqui o nome
-# da camada/tabela de relacionamento entre cod_sf e cod_sf_sat.
-# Deixe None quando o campo estiver diretamente na camada de setores.
-NOME_CAMADA_RELACAO_SF_SAT = None
-NOME_CAMPO_RELACAO_SF = 'cod_sf'
-NOME_CAMPO_RELACAO_SAT = 'cod_sf_sat'
 
 # ================================================================
 # CONFIGURAÇÃO DAS QUADRAS CRIADAS PARA EDIFICAÇÕES ISOLADAS
@@ -39,9 +32,14 @@ NOME_CAMPO_RELACAO_SAT = 'cod_sf_sat'
 # (normalmente metros em uma camada UTM).
 MARGEM_NOVA_QUADRA = 0.001
 
-# O SQ é formado por cod_sf_sat (3 dígitos) + cod_qf (4 dígitos).
-# Exemplo: cod_sf_sat=201 e cod_qf=134 => sq=2010134.
+# A trigger atualizar_sq_quadra preenche cod_sf, cod_sf_sat, cod_qf e sq
+# no banco. O script não atribui manualmente esses campos às novas quadras.
 CRIAR_QUADRA_PARA_EDIFICACAO_ISOLADA = True
+
+# Quadras existentes que precisam ser ampliadas acionam a trigger de
+# sobreposição no banco. Mantenha False enquanto houver sobreposições
+# preexistentes a serem saneadas na base.
+AMPLIAR_QUADRAS_EXISTENTES = False
 
 # Mantenha False para que o Console Python mostre somente conflitos que a
 # trigger de sobreposição poderia rejeitar. Altere para True apenas quando
@@ -75,43 +73,50 @@ def validar_campos_obrigatorios(camadas_campos):
 
     return True
 
-def carregar_mapa_sf_para_sat(layer_relacao):
-    mapa_sf_para_sat = {}
+def escolher_setores_para_processar(layer_setores):
+    """Exibe os setores disponíveis e retorna somente os escolhidos."""
+    setores_por_codigo = {}
 
-    if layer_relacao is None:
-        return mapa_sf_para_sat
-
-    idx_relacao_sf = layer_relacao.fields().indexOf(NOME_CAMPO_RELACAO_SF)
-    idx_relacao_sat = layer_relacao.fields().indexOf(NOME_CAMPO_RELACAO_SAT)
-
-    for feat_relacao in layer_relacao.getFeatures():
-        valor_sf = feat_relacao.attribute(idx_relacao_sf)
-        valor_sat = feat_relacao.attribute(idx_relacao_sat)
-
-        if valor_sf in (None, NULL) or valor_sat in (None, NULL):
+    for setor in layer_setores.getFeatures():
+        valor_cod_sf = setor.attribute(NOME_CAMPO_SETOR)
+        if valor_cod_sf in (None, NULL):
             continue
 
-        chave_sf = str(valor_sf).strip()
-        if chave_sf:
-            try:
-                mapa_sf_para_sat[chave_sf] = int(valor_sat)
-            except (TypeError, ValueError):
-                continue
+        codigo = str(valor_cod_sf).strip()
+        if codigo:
+            setores_por_codigo.setdefault(codigo, []).append(setor)
 
-    return mapa_sf_para_sat
+    if not setores_por_codigo:
+        return None
 
-def obter_cod_sf_sat_do_setor(setor, indice_setor_sat, mapa_sf_para_sat):
-    if indice_setor_sat != -1:
-        valor_sat = setor.attribute(indice_setor_sat)
-        if valor_sat not in (None, NULL):
-            try:
-                return int(valor_sat)
-            except (TypeError, ValueError):
-                return None
+    def chave_ordenacao(codigo):
+        try:
+            return (0, int(codigo))
+        except (TypeError, ValueError):
+            return (1, codigo)
 
-    valor_sf = setor.attribute(NOME_CAMPO_SETOR)
-    chave_sf = '' if valor_sf in (None, NULL) else str(valor_sf).strip()
-    return mapa_sf_para_sat.get(chave_sf)
+    codigos_disponiveis = sorted(setores_por_codigo, key=chave_ordenacao)
+    opcoes = codigos_disponiveis + ['Todos os setores']
+    escolha, confirmou = QInputDialog.getItem(
+        iface.mainWindow(),
+        'Processar setor fiscal',
+        'Selecione o setor fiscal:',
+        opcoes,
+        0,
+        False
+    )
+
+    if not confirmou:
+        return []
+
+    if escolha == 'Todos os setores':
+        return [
+            setor
+            for codigo in codigos_disponiveis
+            for setor in setores_por_codigo[codigo]
+        ]
+
+    return setores_por_codigo[escolha]
 
 def obter_sq_do_lote(feat_lote, indice_sq, indice_sql):
     """Lê o SQ do lote sem atribuí-lo; o banco o gera nos lotes novos."""
@@ -127,50 +132,6 @@ def obter_sq_do_lote(feat_lote, indice_sq, indice_sql):
             return texto_sql[:7]
 
     return None
-
-def obter_proximo_cod_qf(layer_quadras, indice_cod_sf, indice_cod_qf, cod_sf):
-    """Obtém o próximo cod_qf dentro do cod_sf informado."""
-    maior_cod_qf = 0
-
-    if indice_cod_sf == -1 or indice_cod_qf == -1:
-        return None
-
-    try:
-        cod_sf_num = int(cod_sf)
-    except (TypeError, ValueError):
-        return None
-
-    for feat in layer_quadras.getFeatures():
-        valor_sf = feat.attribute(indice_cod_sf)
-        valor_qf = feat.attribute(indice_cod_qf)
-
-        if valor_sf in (None, NULL) or valor_qf in (None, NULL):
-            continue
-
-        try:
-            if int(valor_sf) == cod_sf_num:
-                maior_cod_qf = max(maior_cod_qf, int(valor_qf))
-        except (TypeError, ValueError):
-            continue
-
-    proximo_cod_qf = maior_cod_qf + 1
-    return proximo_cod_qf if proximo_cod_qf <= 9999 else None
-
-def montar_sq(cod_sf_sat, cod_qf):
-    """Monta o SQ no formato fixo: 3 dígitos + 4 dígitos."""
-    cod_sf_sat_num = int(cod_sf_sat)
-    cod_qf_num = int(cod_qf)
-
-    if not 0 <= cod_sf_sat_num <= 999 or not 0 <= cod_qf_num <= 9999:
-        return None
-
-    # O SQ deve sempre ter 7 caracteres:
-    # cod_sf_sat com 3 posições + cod_qf com 4 posições.
-    cod_sf_sat_formatado = f'{cod_sf_sat_num:03d}'
-    cod_qf_formatado = f'{cod_qf_num:04d}'
-    sq = f'{cod_sf_sat_formatado}{cod_qf_formatado}'
-
-    return sq if len(sq) == 7 else None
 
 def ajustar_geometria_para_camada(geometria, eh_multi):
     """Adapta a geometria ao tipo Polygon/MultiPolygon da camada."""
@@ -191,7 +152,12 @@ def ajustar_geometria_para_camada(geometria, eh_multi):
 
     return geometria
 
-def encontrar_colisao_com_quadra(geometrias_finais, geometria_teste, sq_teste):
+def encontrar_colisao_com_quadra(
+    geometrias_finais,
+    geometria_teste,
+    sq_teste,
+    considerar_sq_diferente=True
+):
     """Impede contatos de interior entre quadras com SQs diferentes.
 
     A trigger usa ST_Overlaps. A validação local é deliberadamente mais
@@ -205,14 +171,16 @@ def encontrar_colisao_com_quadra(geometrias_finais, geometria_teste, sq_teste):
         geometria_outra = dados_outra['geom']
         sq_outra = dados_outra['sq']
 
-        # No PostgreSQL, NULL <> valor (e NULL <> NULL) não resulta em TRUE.
-        # Portanto, nesses casos a linha também não entra no IF EXISTS.
-        if sq_teste in (None, NULL) or sq_outra in (None, NULL):
-            continue
+        if considerar_sq_diferente:
+            # No PostgreSQL, NULL <> valor (e NULL <> NULL) não resulta em
+            # TRUE. Portanto, nesses casos a linha também não entra no IF
+            # EXISTS.
+            if sq_teste in (None, NULL) or sq_outra in (None, NULL):
+                continue
 
-        # A trigger não exclui pelo ID: ela exclui pelo SQ.
-        if sq_outra == sq_teste:
-            continue
+            # A trigger não exclui pelo ID: ela exclui pelo SQ.
+            if sq_outra == sq_teste:
+                continue
 
         if not bbox_teste.intersects(geometria_outra.boundingBox()):
             continue
@@ -259,14 +227,22 @@ def citar_identificador_postgres(nome):
     """Protege nomes de esquema, tabela e coluna usados no SELECT."""
     return '"' + str(nome).replace('"', '""') + '"'
 
-def encontrar_colisao_no_postgis(contexto, geometria_teste, sq_teste):
+def encontrar_colisao_no_postgis(
+    contexto,
+    geometria_teste,
+    sq_teste,
+    considerar_sq_diferente=True
+):
     """Executa no servidor a mesma condição ST_Overlaps da trigger."""
-    if sq_teste in (None, NULL):
+    if considerar_sq_diferente and sq_teste in (None, NULL):
         return None, None
 
     try:
         hex_wkb = bytes(geometria_teste.asWkb()).hex()
-        sq_sql = str(sq_teste).replace("'", "''")
+        condicao_sq = ''
+        if considerar_sq_diferente:
+            sq_sql = str(sq_teste).replace("'", "''")
+            condicao_sq = f'b."sq" <> \'{sq_sql}\' AND'
         esquema = contexto['esquema']
         tabela = citar_identificador_postgres(contexto['tabela'])
         if esquema:
@@ -284,8 +260,8 @@ def encontrar_colisao_no_postgis(contexto, geometria_teste, sq_teste):
             SELECT b."id"::text, b."sq"::text
             FROM {tabela} AS b
             CROSS JOIN candidata AS c
-            WHERE b."sq" <> '{sq_sql}'
-              AND b.{geom} && c.geom
+            WHERE {condicao_sq}
+              b.{geom} && c.geom
               AND ST_Overlaps(b.{geom}, c.geom)
             LIMIT 1
         """
@@ -371,38 +347,18 @@ def extrair_lotes_todos_os_setores():
     layer_lotes = obter_camada_do_projeto(NOME_CAMADA_LOTES)
     layer_quadras = obter_camada_do_projeto(NOME_CAMADA_QUADRAS)
     layer_setores = obter_camada_do_projeto(NOME_CAMADA_SETORES)
-    layer_relacao = (
-        obter_camada_do_projeto(NOME_CAMADA_RELACAO_SF_SAT)
-        if NOME_CAMADA_RELACAO_SF_SAT
-        else None
-    )
-    
     if not all([layer_edif, layer_lotes, layer_quadras, layer_setores]):
         iface.messageBar().pushMessage("Erro", "Não foi possível encontrar todas as camadas.", level=Qgis.Critical, duration=7)
         return
 
-    if NOME_CAMADA_RELACAO_SF_SAT and layer_relacao is None:
-        iface.messageBar().pushMessage(
-            'Erro',
-            f'Não foi possível encontrar a camada de relação {NOME_CAMADA_RELACAO_SF_SAT}.',
-            level=Qgis.Critical,
-            duration=10
-        )
-        return
-
     campos_obrigatorios = {
-        layer_quadras: ['sq', 'cod_sf', 'cod_sf_sat', 'cod_qf'],
+        layer_quadras: ['sq'],
         layer_lotes: ['sq', 'cod_lf', 'sql'],
         layer_edif: ['sql'],
         layer_setores: ['cod_sf'],
     }
 
     if not validar_campos_obrigatorios(campos_obrigatorios):
-        return
-
-    if layer_relacao is not None and not validar_campos_obrigatorios({
-        layer_relacao: [NOME_CAMPO_RELACAO_SF, NOME_CAMPO_RELACAO_SAT]
-    }):
         return
 
     camadas_geometricas = [layer_edif, layer_lotes, layer_quadras, layer_setores]
@@ -427,23 +383,17 @@ def extrair_lotes_todos_os_setores():
         )
         return
 
-    indice_setor_sat = layer_setores.fields().indexOf(NOME_CAMPO_SETOR_SAT)
-    if indice_setor_sat == -1 and layer_relacao is None:
-        iface.messageBar().pushMessage(
-            'Erro',
-            f'O campo {NOME_CAMPO_SETOR_SAT} não existe na camada de setores '
-            'e nenhuma camada de relação foi configurada.',
-            level=Qgis.Critical,
-            duration=10
-        )
-        return
-
-    mapa_sf_para_sat = carregar_mapa_sf_para_sat(layer_relacao)
-
-    # Pega todos os setores da camada
-    setores = list(layer_setores.getFeatures())
-    if not setores:
+    setores = escolher_setores_para_processar(layer_setores)
+    if setores is None:
         iface.messageBar().pushMessage("Erro", "Nenhum setor encontrado na camada.", level=Qgis.Critical, duration=5)
+        return
+    if not setores:
+        iface.messageBar().pushMessage(
+            'Cancelado',
+            'Nenhum setor foi processado.',
+            level=Qgis.Info,
+            duration=5
+        )
         return
 
     total_lotes_criados = 0
@@ -452,7 +402,7 @@ def extrair_lotes_todos_os_setores():
     wkb_lotes = layer_lotes.wkbType()
     is_multi_lote = QgsWkbTypes.isMultiType(wkb_lotes)
 
-    idx_q_sq, idx_q_sf, idx_q_sat, idx_q_qf = [layer_quadras.fields().indexOf(f) for f in ['sq', 'cod_sf', 'cod_sf_sat', 'cod_qf']]
+    idx_q_sq = layer_quadras.fields().indexOf('sq')
     idx_l_sq, idx_l_sql, idx_l_lf = [layer_lotes.fields().indexOf(f) for f in ['sq', 'sql', 'cod_lf']]
     idx_e_sql = layer_edif.fields().indexOf('sql')
 
@@ -516,6 +466,7 @@ def extrair_lotes_todos_os_setores():
     is_multi_quadra = QgsWkbTypes.isMultiType(wkb_quadra)
 
     total_quadras_criadas = 0
+    total_ampliacoes_bloqueadas = 0
     # Guarda somente as quadras que este script efetivamente alterou. O
     # resumo final permite confrontá-las com o erro devolvido pelo PostGIS.
     quadras_alteradas = {}
@@ -524,23 +475,7 @@ def extrair_lotes_todos_os_setores():
     # Loop para percorrer CADA SETOR encontrado
     for idx_setor, setor_selecionado in enumerate(setores):
         cod_sf_atual = setor_selecionado.attribute(NOME_CAMPO_SETOR)
-        try:
-            cod_sf_setor = int(cod_sf_atual)
-        except (TypeError, ValueError):
-            cod_sf_setor = None
-
-        cod_sf_sat_setor = obter_cod_sf_sat_do_setor(
-            setor_selecionado,
-            indice_setor_sat,
-            mapa_sf_para_sat
-        )
         diagnostico(f"Processando Setor ({idx_setor + 1}/{len(setores)}) - Código: {cod_sf_atual}")
-
-        if cod_sf_sat_setor is None:
-            diagnostico(
-                f'Setor {cod_sf_atual} sem relação válida com cod_sf_sat. '
-                'Edificações isoladas deste setor não gerarão nova quadra.'
-            )
 
         geom_setor = setor_selecionado.geometry()
         if geom_setor.isEmpty():
@@ -552,7 +487,7 @@ def extrair_lotes_todos_os_setores():
         engine_setor.prepareGeometry()
 
         # Caches espaciais baseados na bbox do setor atual
-        req_quadras = QgsFeatureRequest().setFilterRect(bbox_setor).setSubsetOfAttributes([idx_q_sq, idx_q_sf, idx_q_sat, idx_q_qf])
+        req_quadras = QgsFeatureRequest().setFilterRect(bbox_setor).setSubsetOfAttributes([idx_q_sq])
         quadras_in_bbox = {}
         mapa_quadras_por_sq = {} 
         index_quadras = QgsSpatialIndex()
@@ -706,48 +641,9 @@ def extrair_lotes_todos_os_setores():
                 and not tem_relacao_com_quadra
             )
 
-            # Uma nova quadra/SQ só pode ser criada para uma edificação
+            # Uma nova quadra só pode ser criada para uma edificação
             # sem qualquer relação espacial com lote ou quadra existentes.
             if not quadra_valida and edificacao_isolada and CRIAR_QUADRA_PARA_EDIFICACAO_ISOLADA:
-                cod_sf_novo = cod_sf_setor
-                cod_sf_sat_novo = cod_sf_sat_setor
-
-                if cod_sf_novo is None or not 1 <= cod_sf_novo <= 114:
-                    diagnostico(
-                        f'Edificação ID {feat_edif.id()} ignorada: '
-                        f'cod_sf inválido para o setor {cod_sf_atual}.'
-                    )
-                    continue
-
-                if cod_sf_sat_novo is None or not 88 <= cod_sf_sat_novo <= 201:
-                    diagnostico(
-                        f'Edificação ID {feat_edif.id()} ignorada: '
-                        f'cod_sf_sat inválido para o setor {cod_sf_atual}.'
-                    )
-                    continue
-
-                cod_qf_novo = obter_proximo_cod_qf(
-                    layer_quadras,
-                    idx_q_sf,
-                    idx_q_qf,
-                    cod_sf_novo
-                )
-
-                if cod_qf_novo is None:
-                    diagnostico(
-                        f'Edificação ID {feat_edif.id()} ignorada: '
-                        f'não foi possível gerar cod_qf para cod_sf {cod_sf_novo}.'
-                    )
-                    continue
-
-                str_sq_nova = montar_sq(cod_sf_sat_novo, cod_qf_novo)
-                if str_sq_nova is None or len(str_sq_nova) != 7:
-                    diagnostico(
-                        f'Edificação ID {feat_edif.id()} ignorada: '
-                        f'SQ inválido gerado ({str_sq_nova}).'
-                    )
-                    continue
-
                 geometria_nova_quadra = geom_edif.buffer(MARGEM_NOVA_QUADRA, 5) if MARGEM_NOVA_QUADRA > 0 else QgsGeometry(geom_edif)
                 geometria_nova_quadra = ajustar_geometria_para_camada(geometria_nova_quadra, is_multi_quadra)
 
@@ -765,13 +661,14 @@ def extrair_lotes_todos_os_setores():
                 id_quadras_colidida = encontrar_colisao_com_quadra(
                     geometrias_finais_quadras,
                     geometria_nova_quadra,
-                    str_sq_nova
+                    None,
+                    considerar_sq_diferente=False
                 )
                 if id_quadras_colidida is not None:
                     sq_colidida = geometrias_finais_quadras[id_quadras_colidida]['sq']
                     print(
                         f'[SOBREPOSIÇÃO LOCAL] Edificação ID {feat_edif.id()}: '
-                        f'a nova quadra SQ {str_sq_nova} sobreporia a quadra '
+                        f'a nova quadra sobreporia a quadra '
                         f'SQ {sq_colidida} (ID {id_quadras_colidida}).'
                     )
                     continue
@@ -779,7 +676,8 @@ def extrair_lotes_todos_os_setores():
                 conflito_postgis, erro_postgis = encontrar_colisao_no_postgis(
                     contexto_postgis,
                     geometria_nova_quadra,
-                    str_sq_nova
+                    None,
+                    considerar_sq_diferente=False
                 )
                 if erro_postgis is not None:
                     print(f'[ERRO VALIDAÇÃO POSTGIS] {erro_postgis}')
@@ -794,47 +692,14 @@ def extrair_lotes_todos_os_setores():
                 if conflito_postgis is not None:
                     print(
                         f'[SOBREPOSIÇÃO POSTGIS] Edificação ID {feat_edif.id()}: '
-                        f'a nova quadra SQ {str_sq_nova} sobreporia a quadra '
+                        f'a nova quadra sobreporia a quadra '
                         f'SQ {conflito_postgis["sq"]} (ID {conflito_postgis["id"]}).'
-                    )
-                    continue
-
-                conflito_pendente, erro_postgis = encontrar_colisao_pendente_no_postgis(
-                    contexto_postgis,
-                    geometrias_pendentes_postgis,
-                    geometria_nova_quadra,
-                    str_sq_nova
-                )
-                if erro_postgis is not None:
-                    print(f'[ERRO VALIDAÇÃO POSTGIS] {erro_postgis}')
-                    iface.messageBar().pushMessage(
-                        'Erro',
-                        'A comparação das quadras pendentes no PostGIS falhou. '
-                        'Descarte as alterações desta execução.',
-                        level=Qgis.Critical,
-                        duration=15
-                    )
-                    return
-                if conflito_pendente is not None:
-                    print(
-                        f'[SOBREPOSIÇÃO PENDENTE POSTGIS] Edificação ID '
-                        f'{feat_edif.id()}: a nova quadra SQ {str_sq_nova} '
-                        f'sobreporia a quadra pendente SQ '
-                        f'{conflito_pendente["sq"]} (ID {conflito_pendente["id"]}).'
                     )
                     continue
 
                 nova_feat_quadra = QgsFeature(layer_quadras.fields())
                 nova_feat_quadra.setGeometry(geometria_nova_quadra)
 
-                if idx_q_sq != -1:
-                    nova_feat_quadra[idx_q_sq] = str_sq_nova
-                if idx_q_sf != -1:
-                    nova_feat_quadra[idx_q_sf] = cod_sf_novo
-                if idx_q_sat != -1:
-                    nova_feat_quadra[idx_q_sat] = cod_sf_sat_novo
-                if idx_q_qf != -1:
-                    nova_feat_quadra[idx_q_qf] = cod_qf_novo
                 if not layer_quadras.addFeature(nova_feat_quadra):
                     diagnostico(f'Edificação ID {feat_edif.id()} ignorada: Falha ao inserir a nova quadra.')
                     continue
@@ -842,22 +707,24 @@ def extrair_lotes_todos_os_setores():
                 q_id_novo = nova_feat_quadra.id()
                 geometrias_finais_quadras[q_id_novo] = {
                     'geom': QgsGeometry(geometria_nova_quadra),
-                    'sq': str_sq_nova
+                    'sq': None
                 }
-                quadras_in_bbox[q_id_novo] = nova_feat_quadra
-                quadra_valida = nova_feat_quadra
-                quadra_nova = True
                 total_quadras_criadas += 1
-                quadras_alteradas[q_id_novo] = str_sq_nova
+                quadras_alteradas[q_id_novo] = '(definido pela trigger ao salvar)'
                 geometrias_pendentes_postgis[q_id_novo] = {
                     'geom': QgsGeometry(geometria_nova_quadra),
-                    'sq': str_sq_nova
+                    'sq': None
                 }
 
                 # Não adiciona a nova quadra ao índice de classificação neste
                 # setor. Assim, duas edificações isoladas geram duas quadras,
                 # em vez de a segunda ser absorvida pela primeira.
                 cache_quadras_validas[q_id_novo] = True
+
+                # A trigger só informa os códigos ao PostGIS durante o
+                # salvamento. Após salvar e recarregar as quadras, uma nova
+                # execução criará o lote e atualizará esta edificação.
+                continue
 
             # Se há mais de uma quadra contendo a edificação ou mais de uma
             # quadra tocada, a situação é ambígua e não deve gerar uma quadra.
@@ -897,6 +764,15 @@ def extrair_lotes_todos_os_setores():
                     if q_id not in edificacoes_por_quadra:
                         edificacoes_por_quadra[q_id] = []
                     edificacoes_por_quadra[q_id].append(feat_edif)
+                    continue
+
+                # A edificação está fora da quadra existente. Não crie
+                # lote para ela sem antes ampliar a quadra, pois a trigger de
+                # lotes exige ST_Within(lote.geom, quadra.geom). Quando a
+                # ampliação estiver desabilitada, ignore este caso com
+                # segurança, sem colocar UPDATE geométrico no buffer.
+                if not AMPLIAR_QUADRAS_EXISTENTES:
+                    total_ampliacoes_bloqueadas += 1
                     continue
 
                 distancia_vao = geom_q_atual.distance(geom_edif_atual)
@@ -1010,33 +886,30 @@ def extrair_lotes_todos_os_setores():
 
         # Criação de Lotes para o setor atual
         novas_features_lote = []
+        atualizacoes_edificacoes_de_novos_lotes = []
         for q_id, lista_edif in edificacoes_por_quadra.items():
             quadra = quadras_in_bbox[q_id]
             str_sq = str(quadra.attribute(idx_q_sq)).strip() if quadra.attribute(idx_q_sq) not in (None, NULL) else ""
             if len(str_sq) != 7:
                 diagnostico(f'Quadra ID {q_id}: SQ inválido ({str_sq}).')
                 continue
-                
+
             cod_lf_atual = max_lf_dict.get(str_sq, 0) + 1
-            
             for feat_edif in lista_edif: 
                 if cod_lf_atual > 9999:
                     diagnostico(f'Quadra {str_sq}: limite de lotes atingido.')
                     break
 
                 str_lf_atual = str(cod_lf_atual).zfill(4)
-                str_sql_atual = f"{str_sq}{str_lf_atual}" 
+                str_sql_atual = f"{str_sq}{str_lf_atual}"
 
                 if len(str_sql_atual) != 11:
                     diagnostico(f'SQL inválido: {str_sql_atual}')
                     cod_lf_atual += 1
                     continue
-                
-                # O script atribui apenas SQL. SQ do lote e SQLE da
-                # edificação são preenchidos automaticamente pelo banco.
-                atributos_novos = {idx_e_sql: str_sql_atual}
-                mapa_edificacoes_para_atualizar[feat_edif.id()] = atributos_novos
 
+                # O SQ do lote é confirmado pela trigger. O script gera
+                # manualmente cod_lf e SQL a partir do SQ da quadra escolhida.
                 geom_lote = QgsGeometry(feat_edif.geometry())
                 if is_multi_lote and not geom_lote.isMultipart():
                     geom_lote.convertToMultiType()
@@ -1049,19 +922,40 @@ def extrair_lotes_todos_os_setores():
                             geom_simples_l = part
                     geom_lote = geom_simples_l
 
+                if geom_lote.isEmpty() or not geom_lote.isGeosValid():
+                    diagnostico(
+                        f'Edificação ID {feat_edif.id()} ignorada: '
+                        'a geometria do lote seria inválida.'
+                    )
+                    continue
+
                 nova_feat_lote = QgsFeature(layer_lotes.fields())
                 nova_feat_lote.setGeometry(geom_lote)
-                
-                if idx_l_sql != -1: nova_feat_lote[idx_l_sql] = str_sql_atual
-                if idx_l_lf != -1: nova_feat_lote[idx_l_lf] = cod_lf_atual
-                
+
+                # A trigger atualizar_sql_lote confirma o SQ espacial. Como
+                # cod_lf não é nulo, ela preserva a numeração e o SQL
+                # calculados pelo script.
+                if idx_l_lf != -1:
+                    nova_feat_lote[idx_l_lf] = cod_lf_atual
+                if idx_l_sql != -1:
+                    nova_feat_lote[idx_l_sql] = str_sql_atual
+
                 novas_features_lote.append(nova_feat_lote)
+                atualizacoes_edificacoes_de_novos_lotes.append(
+                    (feat_edif.id(), str_sql_atual)
+                )
                 cod_lf_atual += 1
 
         # Acumula as inserções/atualizações na sessão de edição aberta
         if novas_features_lote:
-            layer_lotes.addFeatures(novas_features_lote)
-            total_lotes_criados += len(novas_features_lote)
+            if layer_lotes.addFeatures(novas_features_lote):
+                total_lotes_criados += len(novas_features_lote)
+                for fid_edif, sql_edif in atualizacoes_edificacoes_de_novos_lotes:
+                    mapa_edificacoes_para_atualizar[fid_edif] = {
+                        idx_e_sql: sql_edif
+                    }
+            else:
+                diagnostico('Não foi possível adicionar os novos lotes ao buffer do QGIS.')
 
         if mapa_edificacoes_para_atualizar:
             for fid, atributos in mapa_edificacoes_para_atualizar.items():
@@ -1095,10 +989,23 @@ def extrair_lotes_todos_os_setores():
             f'{lista_quadras_alteradas}'
         )
 
+    if total_ampliacoes_bloqueadas:
+        print(
+            '[AMPLIAÇÕES BLOQUEADAS] '
+            f'{total_ampliacoes_bloqueadas} edificação(ões) ficaram sem lote '
+            'porque exigiriam alteração de geometria em quadra existente.'
+        )
+
     if total_lotes_criados > 0 or total_edif_atualizadas > 0 or total_quadras_criadas > 0:
+        orientacao_salvamento = (
+            'Salve quadras e recarregue a camada. Execute o script novamente '
+            'para gerar os lotes e atualizar as edificações das novas quadras.'
+            if total_quadras_criadas > 0 else
+            'Salve lotes e, por fim, edificações.'
+        )
         iface.messageBar().pushMessage(
             "Sucesso Geral",
-            f"Processo concluído para todos os setores! {total_quadras_criadas} Quadra(s) e {total_lotes_criados} Lote(s) criado(s), além de {total_edif_atualizadas} Edificação(ões) atualizada(s). Revise e salve manualmente.",
+            f"Processo concluído para todos os setores! {total_quadras_criadas} Quadra(s) e {total_lotes_criados} Lote(s) criado(s), além de {total_edif_atualizadas} Edificação(ões) atualizada(s). {orientacao_salvamento}",
             level=Qgis.Success,
             duration=10
         )
